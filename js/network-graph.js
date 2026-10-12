@@ -1,5 +1,7 @@
 // Network graph visualization for detroit.primals.eco
 // Renders actor/entity relationships as an interactive force-directed graph.
+// Body awareness: 0=raw(graph.json), 1=sorted(classification.json),
+//   2=observed(gaia core + moon orbit + π ratio).
 //
 // Data source: window.DETROIT_NETWORK (loaded from network-data.js)
 // Fallback: petalTongue API /api/public-record/network
@@ -7,7 +9,6 @@
 (function() {
   'use strict';
 
-  // ── Resolve data from shared data layer ─────────────────────────────
   var DN = window.DETROIT_NETWORK || {};
   var COLORS = DN.nodeColors || {};
   var LINK_COLORS = DN.edgeColors || {};
@@ -18,1075 +19,646 @@
   var ADDRESS_CLUSTERS = DN.addressClusters || [];
   var OVERSIGHT_CYCLES = DN.oversightCycles || [];
   var COMMUNITIES = DN.communities || [];
+  var SORT_COLORS = DN.sortColors || {
+    'non-self': '#e74c3c', 'self': '#27ae60', 'null': '#7f8c8d',
+    'partial': '#f39c12', 'other': '#3498db', 'unknown': 'rgba(128,128,128,0.3)'
+  };
+  var SORT_RADIUS = { 'non-self': 0.20, 'partial': 0.35, 'null': 0.50, 'self': 0.65, 'other': 0.80, 'unknown': 0.90 };
 
-  // ── Nexus filter state ─────────────────────────────────────────────
+  var classificationData = null;
+  var bodyLevel = 0;
+  var showSort = false;
   var activeNexus = { education: true, political: true, enforcement: true, weaponization: true, legislative: true };
-  var showOwnership = false;
-  var showAddress = false;
-  var showCycles = false;
-  var activeFlows = null;
-  var activeDynasty = null;
+  var showOwnership = false, showAddress = false, showCycles = false;
+  var activeFlows = null, activeDynasty = null;
+  var collapseStrategy = null;
+  var expandedGroups = {};
 
-  // ── Collapse state ─────────────────────────────────────────────────
-  var collapseStrategy = null; // null | 'community' | 'ownership' | 'address' | 'dynasty'
-  var expandedGroups = {};     // group id → true for expanded groups
+  var DYNASTY_COLORS = { kilpatrick:'#a855f7', stallworth:'#f59e0b', sabree:'#60a5fa', banks_flenory:'#ef4444', mayoral:'#94a3b8' };
+  var DYNASTY_LABELS = { kilpatrick:'Kilpatrick', stallworth:'Stallworth', sabree:'Sabree', banks_flenory:'Banks/BMF', mayoral:'Mayors' };
 
-  // ── Focal lens state (baseCamp 53 / 68) ─────────────────────────
-  // Layout uses C(n) ∝ π^(n/2) — focal distance = 1/π^(tier/2)
-  var focalLens = false;
+  function svgEl(tag, attrs, parent) {
+    var el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    if (attrs) Object.keys(attrs).forEach(function(k) { el.setAttribute(k, attrs[k]); });
+    if (parent) parent.appendChild(el);
+    return el;
+  }
 
-  var DYNASTY_COLORS = {
-    kilpatrick: '#a855f7',
-    stallworth: '#f59e0b',
-    sabree: '#60a5fa',
-    banks_flenory: '#ef4444',
-    mayoral: '#94a3b8',
-  };
-  var DYNASTY_LABELS = {
-    kilpatrick: 'Kilpatrick',
-    stallworth: 'Stallworth',
-    sabree: 'Sabree',
-    banks_flenory: 'Banks/BMF',
-    mayoral: 'Mayors',
-  };
+  function svgText(text, attrs, parent) {
+    var el = svgEl('text', attrs, parent);
+    el.textContent = text;
+    return el;
+  }
 
-  function renderGraph(container, data) {
-    var width = container.clientWidth || 800;
-    var height = Math.max(700, width * 0.75);
+  function convexHull(points) {
+    if (points.length < 3) return points;
+    points.sort(function(a, b) { return a[0] - b[0] || a[1] - b[1]; });
+    var lower = [], upper = [];
+    for (var i = 0; i < points.length; i++) {
+      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], points[i]) <= 0) lower.pop();
+      lower.push(points[i]);
+    }
+    for (var i = points.length - 1; i >= 0; i--) {
+      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], points[i]) <= 0) upper.pop();
+      upper.push(points[i]);
+    }
+    upper.pop(); lower.pop();
+    return lower.concat(upper);
+  }
+  function cross(O, A, B) { return (A[0] - O[0]) * (B[1] - O[1]) - (A[1] - O[1]) * (B[0] - O[0]); }
 
-    // ── Build nexus filter controls ──────────────────────────────────
-    var controls = container.querySelector('.graph-controls');
-    if (!controls) {
-      controls = document.createElement('div');
-      controls.className = 'graph-controls';
-      controls.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center;';
-      var label = document.createElement('span');
-      label.textContent = 'Nexus overlay:';
-      label.style.cssText = 'font-size:12px;font-weight:600;opacity:0.7;margin-right:4px;';
-      controls.appendChild(label);
-      var nexusLabels = { education: 'Education', political: 'Political', enforcement: 'Enforcement', weaponization: 'Weaponization', legislative: 'Legislative' };
-      ['education', 'political', 'enforcement', 'weaponization', 'legislative'].forEach(function(nx) {
-        var btn = document.createElement('button');
-        btn.textContent = nexusLabels[nx];
-        btn.dataset.nexus = nx;
-        btn.style.cssText = 'padding:4px 12px;border:2px solid ' + NEXUS_COLORS[nx] +
-          ';border-radius:14px;font-size:11px;font-weight:600;cursor:pointer;transition:all 0.2s;' +
-          'background:' + NEXUS_COLORS[nx] + ';color:#fff;';
-        btn.addEventListener('click', function() {
+  // ═══ CONTROLS ═══
+  function buildControls(ctx) {
+    var c = ctx.container, data = ctx.data;
+    var controls = c.querySelector('.graph-controls');
+    if (controls) { ctx.controls = controls; return; }
+    controls = document.createElement('div');
+    controls.className = 'graph-controls';
+    controls.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center;';
+
+    function addLabel(text) {
+      var s = document.createElement('span');
+      s.textContent = text;
+      s.style.cssText = 'font-size:12px;font-weight:600;opacity:0.7;margin-right:4px;';
+      controls.appendChild(s);
+    }
+    function addSep() {
+      var s = document.createElement('span');
+      s.style.cssText = 'width:1px;height:20px;background:rgba(128,128,128,0.3);margin:0 4px;';
+      controls.appendChild(s);
+    }
+    function addBtn(label, style, onClick) {
+      var b = document.createElement('button');
+      b.textContent = label;
+      b.style.cssText = style;
+      b.addEventListener('click', onClick);
+      controls.appendChild(b);
+      return b;
+    }
+    var btnBase = 'padding:4px 12px;border-radius:14px;font-size:11px;font-weight:600;cursor:pointer;transition:all 0.2s;';
+
+    addLabel('Nexus overlay:');
+    var nexusLabels = { education:'Education', political:'Political', enforcement:'Enforcement', weaponization:'Weaponization', legislative:'Legislative' };
+    ['education','political','enforcement','weaponization','legislative'].forEach(function(nx) {
+      var btn = addBtn(nexusLabels[nx],
+        btnBase + 'border:2px solid ' + NEXUS_COLORS[nx] + ';background:' + NEXUS_COLORS[nx] + ';color:#fff;',
+        function() {
           activeNexus[nx] = !activeNexus[nx];
           btn.style.background = activeNexus[nx] ? NEXUS_COLORS[nx] : 'transparent';
           btn.style.color = activeNexus[nx] ? '#fff' : NEXUS_COLORS[nx];
-          renderGraph(container, data);
+          renderGraph(c, data);
         });
-        controls.appendChild(btn);
-      });
-      var allBtn = document.createElement('button');
-      allBtn.textContent = 'All';
-      allBtn.style.cssText = 'padding:4px 10px;border:1px solid #888;border-radius:14px;font-size:10px;cursor:pointer;background:transparent;color:inherit;';
-      allBtn.addEventListener('click', function() {
+      btn.dataset.nexus = nx;
+    });
+
+    var allBtn = addBtn('All',
+      btnBase + 'border:2px solid #7f8c8d;background:transparent;color:#7f8c8d;',
+      function() {
         Object.keys(activeNexus).forEach(function(k) { activeNexus[k] = true; });
-        controls.querySelectorAll('button[data-nexus]').forEach(function(b) {
-          b.style.background = NEXUS_COLORS[b.dataset.nexus];
-          b.style.color = '#fff';
+        controls.querySelectorAll('[data-nexus]').forEach(function(b) {
+          b.style.background = NEXUS_COLORS[b.dataset.nexus]; b.style.color = '#fff';
         });
-        renderGraph(container, data);
+        renderGraph(c, data);
       });
-      controls.appendChild(allBtn);
 
-      // Layer separator
-      var sep = document.createElement('span');
-      sep.textContent = '│';
-      sep.style.cssText = 'opacity:0.3;margin:0 4px;';
-      controls.appendChild(sep);
+    addSep();
 
-      // Ownership hull toggle
-      var ownBtn = document.createElement('button');
-      ownBtn.textContent = '⬡ Ownership';
-      ownBtn.dataset.layer = 'ownership';
-      ownBtn.style.cssText = 'padding:4px 12px;border:2px solid #e74c3c;border-radius:14px;font-size:11px;font-weight:600;cursor:pointer;transition:all 0.2s;background:transparent;color:#e74c3c;';
-      ownBtn.addEventListener('click', function() {
+    var ownerBtn = addBtn('⬡ Ownership', btnBase + 'border:2px solid rgba(192,57,43,0.5);background:transparent;color:#c0392b;',
+      function() {
         showOwnership = !showOwnership;
-        ownBtn.style.background = showOwnership ? '#e74c3c' : 'transparent';
-        ownBtn.style.color = showOwnership ? '#fff' : '#e74c3c';
-        renderGraph(container, data);
+        ownerBtn.style.background = showOwnership ? 'rgba(192,57,43,0.15)' : 'transparent';
+        renderGraph(c, data);
       });
-      controls.appendChild(ownBtn);
-
-      // Address overlap toggle
-      var addrBtn = document.createElement('button');
-      addrBtn.textContent = '📍 Address';
-      addrBtn.dataset.layer = 'address';
-      addrBtn.style.cssText = 'padding:4px 12px;border:2px solid #d35400;border-radius:14px;font-size:11px;font-weight:600;cursor:pointer;transition:all 0.2s;background:transparent;color:#d35400;';
-      addrBtn.addEventListener('click', function() {
+    var addrBtn = addBtn('📍 Addresses', btnBase + 'border:2px solid rgba(211,84,0,0.5);background:transparent;color:#d35400;',
+      function() {
         showAddress = !showAddress;
-        addrBtn.style.background = showAddress ? '#d35400' : 'transparent';
-        addrBtn.style.color = showAddress ? '#fff' : '#d35400';
-        renderGraph(container, data);
+        addrBtn.style.background = showAddress ? 'rgba(211,84,0,0.15)' : 'transparent';
+        renderGraph(c, data);
       });
-      controls.appendChild(addrBtn);
-
-      // Cycle detection toggle
-      var cycBtn = document.createElement('button');
-      cycBtn.textContent = '⟳ Cycles';
-      cycBtn.dataset.layer = 'cycles';
-      cycBtn.style.cssText = 'padding:4px 12px;border:2px solid #e67e22;border-radius:14px;font-size:11px;font-weight:600;cursor:pointer;transition:all 0.2s;background:transparent;color:#e67e22;';
-      cycBtn.addEventListener('click', function() {
+    var cycBtn = addBtn('⟳ Cycles', btnBase + 'border:2px solid rgba(230,126,34,0.5);background:transparent;color:#e67e22;',
+      function() {
         showCycles = !showCycles;
-        cycBtn.style.background = showCycles ? '#e67e22' : 'transparent';
-        cycBtn.style.color = showCycles ? '#fff' : '#e67e22';
-        renderGraph(container, data);
+        cycBtn.style.background = showCycles ? 'rgba(230,126,34,0.15)' : 'transparent';
+        renderGraph(c, data);
       });
-      controls.appendChild(cycBtn);
 
-      // Dynasty separator
-      var sepD = document.createElement('span');
-      sepD.textContent = '│';
-      sepD.style.cssText = 'opacity:0.3;margin:0 4px;';
-      controls.appendChild(sepD);
+    addSep();
 
-      var dynLabel = document.createElement('span');
-      dynLabel.textContent = 'Dynasty:';
-      dynLabel.style.cssText = 'font-size:12px;font-weight:600;opacity:0.7;';
-      controls.appendChild(dynLabel);
-
-      Object.keys(DYNASTY_COLORS).forEach(function(dy) {
-        var btn = document.createElement('button');
-        btn.textContent = DYNASTY_LABELS[dy];
-        btn.dataset.dynasty = dy;
-        btn.style.cssText = 'padding:4px 10px;border:2px solid ' + DYNASTY_COLORS[dy] +
-          ';border-radius:14px;font-size:10px;font-weight:600;cursor:pointer;transition:all 0.2s;' +
-          'background:transparent;color:' + DYNASTY_COLORS[dy] + ';';
-        btn.addEventListener('click', function() {
-          activeDynasty = activeDynasty === dy ? null : dy;
-          controls.querySelectorAll('button[data-dynasty]').forEach(function(b) {
-            var d2 = b.dataset.dynasty;
-            b.style.background = activeDynasty === d2 ? DYNASTY_COLORS[d2] : 'transparent';
-            b.style.color = activeDynasty === d2 ? '#fff' : DYNASTY_COLORS[d2];
+    var dynastyKeys = Object.keys(DYNASTY_COLORS);
+    if (dynastyKeys.length) {
+      addLabel('Dynasty:');
+      dynastyKeys.forEach(function(dk) {
+        var db = addBtn(DYNASTY_LABELS[dk] || dk,
+          btnBase + 'border:2px solid ' + DYNASTY_COLORS[dk] + ';background:transparent;color:' + DYNASTY_COLORS[dk] + ';',
+          function() {
+            activeDynasty = activeDynasty === dk ? null : dk;
+            dynastyKeys.forEach(function(k) {
+              var el = controls.querySelector('[data-dynasty="' + k + '"]');
+              if (el) {
+                el.style.background = activeDynasty === k ? DYNASTY_COLORS[k] : 'transparent';
+                el.style.color = activeDynasty === k ? '#fff' : DYNASTY_COLORS[k];
+              }
+            });
+            renderGraph(c, data);
           });
-          renderGraph(container, data);
-        });
-        controls.appendChild(btn);
+        db.dataset.dynasty = dk;
       });
-
-      // Flow type separator
-      var sep2 = document.createElement('span');
-      sep2.textContent = '│';
-      sep2.style.cssText = 'opacity:0.3;margin:0 4px;';
-      controls.appendChild(sep2);
-
-      // Flow type label
-      var flowLabel = document.createElement('span');
-      flowLabel.textContent = 'Flows:';
-      flowLabel.style.cssText = 'font-size:12px;font-weight:600;opacity:0.7;';
-      controls.appendChild(flowLabel);
-
-      // Flow type filter buttons
-      ['money', 'power', 'influence', 'position'].forEach(function(ft) {
-        var btn = document.createElement('button');
-        btn.textContent = FLOW_ICONS[ft] + ' ' + ft.charAt(0).toUpperCase() + ft.slice(1);
-        btn.dataset.flow = ft;
-        btn.style.cssText = 'padding:4px 10px;border:2px solid ' + FLOW_COLORS[ft] +
-          ';border-radius:14px;font-size:10px;font-weight:600;cursor:pointer;transition:all 0.2s;' +
-          'background:transparent;color:' + FLOW_COLORS[ft] + ';';
-        btn.addEventListener('click', function() {
-          if (!activeFlows) {
-            activeFlows = { money: false, power: false, influence: false, position: false };
-          }
-          activeFlows[ft] = !activeFlows[ft];
-          var anyFlowActive = Object.values(activeFlows).some(function(v) { return v; });
-          if (!anyFlowActive) activeFlows = null;
-          btn.style.background = (activeFlows && activeFlows[ft]) ? FLOW_COLORS[ft] : 'transparent';
-          btn.style.color = (activeFlows && activeFlows[ft]) ? '#fff' : FLOW_COLORS[ft];
-          renderGraph(container, data);
-        });
-        controls.appendChild(btn);
-      });
-
-      // Collapse separator
-      var sep3 = document.createElement('span');
-      sep3.textContent = '│';
-      sep3.style.cssText = 'opacity:0.3;margin:0 4px;';
-      controls.appendChild(sep3);
-
-      // Collapse dropdown
-      var collapseWrap = document.createElement('span');
-      collapseWrap.style.cssText = 'position:relative;display:inline-block;';
-      var collapseBtn = document.createElement('button');
-      collapseBtn.textContent = '◈ Collapse';
-      collapseBtn.style.cssText = 'padding:4px 12px;border:2px solid #1abc9c;border-radius:14px;font-size:11px;font-weight:600;cursor:pointer;transition:all 0.2s;background:transparent;color:#1abc9c;';
-      collapseWrap.appendChild(collapseBtn);
-
-      var collapseMenu = document.createElement('div');
-      collapseMenu.style.cssText = 'display:none;position:absolute;top:100%;left:0;background:rgba(0,0,0,0.92);border:1px solid #1abc9c;border-radius:8px;padding:4px 0;z-index:20;min-width:140px;margin-top:4px;';
-      var strategies = [
-        { id: null, label: 'Off (all nodes)' },
-        { id: 'community', label: '◈ Community' },
-        { id: 'ownership', label: '⬡ Ownership' },
-        { id: 'address', label: '📍 Address' },
-        { id: 'dynasty', label: '👑 Dynasty' }
-      ];
-      strategies.forEach(function(s) {
-        var item = document.createElement('div');
-        item.textContent = s.label;
-        item.style.cssText = 'padding:6px 14px;cursor:pointer;font-size:11px;color:#fff;transition:background 0.15s;white-space:nowrap;';
-        item.addEventListener('mouseenter', function() { item.style.background = 'rgba(26,188,156,0.3)'; });
-        item.addEventListener('mouseleave', function() { item.style.background = 'transparent'; });
-        item.addEventListener('click', function(e) {
-          e.stopPropagation();
-          collapseStrategy = s.id;
-          expandedGroups = {};
-          collapseMenu.style.display = 'none';
-          collapseBtn.style.background = s.id ? '#1abc9c' : 'transparent';
-          collapseBtn.style.color = s.id ? '#fff' : '#1abc9c';
-          collapseBtn.textContent = s.id ? '◈ ' + s.label.replace(/^[^\s]+\s/, '') : '◈ Collapse';
-          renderGraph(container, data);
-        });
-        collapseMenu.appendChild(item);
-      });
-      collapseWrap.appendChild(collapseMenu);
-
-      collapseBtn.addEventListener('click', function(e) {
-        e.stopPropagation();
-        collapseMenu.style.display = collapseMenu.style.display === 'none' ? 'block' : 'none';
-      });
-      document.addEventListener('click', function() { collapseMenu.style.display = 'none'; });
-
-      controls.appendChild(collapseWrap);
-
-      // Focal lens separator + button (baseCamp 53/68)
-      var sep4 = document.createElement('span');
-      sep4.textContent = '│';
-      sep4.style.cssText = 'opacity:0.3;margin:0 4px;';
-      controls.appendChild(sep4);
-
-      var focalBtn = document.createElement('button');
-      focalBtn.textContent = 'π Focal Lens';
-      focalBtn.dataset.focal = 'true';
-      focalBtn.style.cssText = 'padding:4px 12px;border:2px solid #c084fc;border-radius:14px;font-size:11px;font-weight:600;cursor:pointer;transition:all 0.2s;background:transparent;color:#c084fc;';
-      focalBtn.addEventListener('click', function() {
-        focalLens = !focalLens;
-        focalBtn.style.background = focalLens ? '#c084fc' : 'transparent';
-        focalBtn.style.color = focalLens ? '#fff' : '#c084fc';
-        renderGraph(container, data);
-      });
-      if (focalLens) {
-        focalBtn.style.background = '#c084fc';
-        focalBtn.style.color = '#fff';
-      }
-      controls.appendChild(focalBtn);
-
-      container.insertBefore(controls, container.firstChild);
     }
 
-    // ── Filter nodes by active nexus ──────────────────────────────────
+    addSep();
+
+    addLabel('Flow:');
+    Object.keys(FLOW_COLORS).forEach(function(ft) {
+      var fb = addBtn(FLOW_ICONS[ft] + ' ' + ft.charAt(0).toUpperCase() + ft.slice(1),
+        btnBase + 'border:2px solid ' + FLOW_COLORS[ft] + ';background:transparent;color:' + FLOW_COLORS[ft] + ';',
+        function() {
+          if (!activeFlows) activeFlows = {};
+          activeFlows[ft] = !activeFlows[ft];
+          fb.style.background = activeFlows[ft] ? FLOW_COLORS[ft] + '22' : 'transparent';
+          if (!Object.values(activeFlows).some(function(v) { return v; })) activeFlows = null;
+          renderGraph(c, data);
+        });
+      fb.dataset.flow = ft;
+    });
+
+    addSep();
+
+    addLabel('Collapse:');
+    var collapseWrap = document.createElement('span');
+    collapseWrap.style.position = 'relative';
+    var collapseBtn = addBtn(collapseStrategy ? '▾ ' + collapseStrategy : '▸ None',
+      btnBase + 'border:2px solid #7f8c8d;background:transparent;color:#7f8c8d;', function() {
+        collapseMenu.style.display = collapseMenu.style.display === 'block' ? 'none' : 'block';
+      });
+    collapseWrap.appendChild(collapseBtn);
+    var collapseMenu = document.createElement('div');
+    collapseMenu.style.cssText = 'display:none;position:absolute;top:100%;left:0;background:#1a1a2e;border:1px solid #30363d;border-radius:6px;z-index:100;min-width:140px;padding:4px 0;';
+    [{ key: null, label: 'None' }, { key: 'community', label: 'Community' },
+     { key: 'ownership', label: 'Ownership' }, { key: 'address', label: 'Address' },
+     { key: 'dynasty', label: 'Dynasty' }].forEach(function(opt) {
+      var item = document.createElement('div');
+      item.textContent = (collapseStrategy === opt.key ? '● ' : '○ ') + opt.label;
+      item.style.cssText = 'padding:4px 12px;font-size:11px;cursor:pointer;color:#c9d1d9;';
+      item.addEventListener('mouseenter', function() { item.style.background = 'rgba(88,166,255,0.1)'; });
+      item.addEventListener('mouseleave', function() { item.style.background = 'transparent'; });
+      item.addEventListener('click', function() {
+        collapseStrategy = opt.key; expandedGroups = {};
+        collapseMenu.style.display = 'none';
+        collapseBtn.textContent = opt.key ? '▾ ' + opt.key : '▸ None';
+        renderGraph(c, data);
+      });
+      collapseMenu.appendChild(item);
+    });
+    collapseWrap.appendChild(collapseMenu);
+    controls.appendChild(collapseWrap);
+
+    addSep();
+
+    var sortBtn = addBtn('◉ Sort', btnBase + 'border:2px solid #e67e22;background:transparent;color:#e67e22;',
+      function() {
+        showSort = !showSort;
+        sortBtn.style.background = showSort ? '#e67e2222' : 'transparent';
+        renderGraph(c, data);
+      });
+
+    c.insertBefore(controls, c.firstChild);
+    ctx.controls = controls;
+  }
+
+  // ═══ FILTER + COLLAPSE ═══
+  function filterAndCollapse(ctx) {
+    var data = ctx.data;
     var anyActive = Object.values(activeNexus).some(function(v) { return v; });
-    var filteredNodes = data.nodes.filter(function(n) {
+    ctx.filteredNodes = data.nodes.filter(function(n) {
       if (!anyActive) return true;
-      if (!n.nexus || n.nexus.length === 0) return true;
-      return n.nexus.some(function(nx) { return activeNexus[nx]; });
+      return !n.nexus || !n.nexus.length || n.nexus.some(function(nx) { return activeNexus[nx]; });
     });
     var visibleIds = {};
-    filteredNodes.forEach(function(n) { visibleIds[n.id] = true; });
-    var filteredLinks = data.links.filter(function(l) {
-      return visibleIds[l.source] && visibleIds[l.target];
+    ctx.filteredNodes.forEach(function(n) { visibleIds[n.id] = true; });
+    ctx.filteredLinks = data.links.filter(function(l) { return visibleIds[l.source] && visibleIds[l.target]; });
+
+    if (!collapseStrategy) return;
+    var groups = [];
+    if (collapseStrategy === 'community') {
+      groups = COMMUNITIES.map(function(c) { return { id: 'comm_' + c.id, label: c.label, members: c.members, color: c.color }; });
+    } else if (collapseStrategy === 'ownership') {
+      groups = OWNERSHIP_GROUPS.map(function(g) { return { id: 'own_' + g.id, label: g.label, members: g.members, color: '#e74c3c' }; });
+    } else if (collapseStrategy === 'address') {
+      groups = ADDRESS_CLUSTERS.map(function(a) { return { id: 'addr_' + a.id, label: a.label, members: a.members, color: '#d35400' }; });
+    } else if (collapseStrategy === 'dynasty') {
+      var dynGroups = {};
+      ctx.filteredNodes.forEach(function(n) {
+        var dy = n.dynasty || '_ungrouped';
+        if (!dynGroups[dy]) dynGroups[dy] = [];
+        dynGroups[dy].push(n.id);
+      });
+      Object.keys(dynGroups).forEach(function(dy) {
+        if (dy === '_ungrouped' || dynGroups[dy].length < 2) return;
+        groups.push({ id: 'dyn_' + dy, label: (DYNASTY_LABELS[dy] || dy) + ' dynasty', members: dynGroups[dy], color: DYNASTY_COLORS[dy] || '#7f8c8d' });
+      });
+    }
+
+    var nodeToGroup = {}, groupedNodeIds = {};
+    groups.forEach(function(g) {
+      if (expandedGroups[g.id]) return;
+      g.members.forEach(function(mid) { if (visibleIds[mid]) { nodeToGroup[mid] = g.id; groupedNodeIds[mid] = true; } });
     });
 
-    // ── Collapse aggregation ─────────────────────────────────────────
-    if (collapseStrategy) {
-      var groups = [];
-      if (collapseStrategy === 'community') {
-        groups = COMMUNITIES.map(function(c) {
-          return { id: 'comm_' + c.id, label: c.label, members: c.members, color: c.color };
-        });
-      } else if (collapseStrategy === 'ownership') {
-        groups = OWNERSHIP_GROUPS.map(function(g) {
-          return { id: 'own_' + g.id, label: g.label, members: g.members, color: g.stroke.replace(/rgba?\([^)]+\)/, '#e74c3c') };
-        });
-      } else if (collapseStrategy === 'address') {
-        groups = ADDRESS_CLUSTERS.map(function(a) {
-          return { id: 'addr_' + a.id, label: a.label, members: a.members, color: a.stroke.replace(/rgba?\([^)]+\)/, '#d35400') };
-        });
-      } else if (collapseStrategy === 'dynasty') {
-        var dynGroups = {};
-        filteredNodes.forEach(function(n) {
-          var dy = n.dynasty || '_ungrouped';
-          if (!dynGroups[dy]) dynGroups[dy] = [];
-          dynGroups[dy].push(n.id);
-        });
-        Object.keys(dynGroups).forEach(function(dy) {
-          if (dy === '_ungrouped' || dynGroups[dy].length < 2) return;
-          groups.push({
-            id: 'dyn_' + dy,
-            label: (DYNASTY_LABELS[dy] || dy) + ' dynasty',
-            members: dynGroups[dy],
-            color: DYNASTY_COLORS[dy] || '#7f8c8d'
-          });
-        });
-      }
-
-      // Build: which nodes are assigned to a collapsed group?
-      var nodeToGroup = {};
-      var groupedNodeIds = {};
-      groups.forEach(function(g) {
-        if (expandedGroups[g.id]) return;
-        g.members.forEach(function(mid) {
-          if (visibleIds[mid]) {
-            nodeToGroup[mid] = g.id;
-            groupedNodeIds[mid] = true;
-          }
-        });
+    var superNodes = [];
+    groups.forEach(function(g) {
+      if (expandedGroups[g.id]) return;
+      var memberNodes = g.members.filter(function(m) { return visibleIds[m]; });
+      if (!memberNodes.length) return;
+      var edgeCount = 0;
+      ctx.filteredLinks.forEach(function(l) { if (nodeToGroup[l.source] === g.id || nodeToGroup[l.target] === g.id) edgeCount++; });
+      superNodes.push({
+        id: g.id, label: g.label, tier: 3, type: 'super', detail: memberNodes.length + ' nodes, ' + edgeCount + ' connections',
+        url: null, nexus: [], dynasty: null, era: null, community: -1,
+        _isSuper: true, _members: memberNodes, _color: g.color, _memberCount: memberNodes.length
       });
+    });
 
-      // Build super-nodes for collapsed groups
-      var superNodes = [];
-      var superNodeMap = {};
-      groups.forEach(function(g) {
-        if (expandedGroups[g.id]) return;
-        var memberNodes = g.members.filter(function(m) { return visibleIds[m]; });
-        if (memberNodes.length === 0) return;
-        var edgeCount = 0;
-        filteredLinks.forEach(function(l) {
-          if (nodeToGroup[l.source] === g.id || nodeToGroup[l.target] === g.id) edgeCount++;
-        });
-        superNodes.push({
-          id: g.id,
-          label: g.label,
-          tier: 3,
-          type: 'super',
-          detail: memberNodes.length + ' nodes, ' + edgeCount + ' connections',
-          url: null,
-          nexus: [],
-          dynasty: null,
-          era: null,
-          community: -1,
-          _isSuper: true,
-          _members: memberNodes,
-          _color: g.color,
-          _memberCount: memberNodes.length
-        });
-        superNodeMap[g.id] = true;
+    ctx.filteredNodes = ctx.filteredNodes.filter(function(n) { return !groupedNodeIds[n.id]; }).concat(superNodes);
+    visibleIds = {};
+    ctx.filteredNodes.forEach(function(n) { visibleIds[n.id] = true; });
+
+    ctx.filteredLinks = ctx.filteredLinks.map(function(l) {
+      return { source: nodeToGroup[l.source] || l.source, target: nodeToGroup[l.target] || l.target,
+               type: l.type, flow: l.flow, label: l.label, amount: l.amount };
+    }).filter(function(l) { return l.source !== l.target && visibleIds[l.source] && visibleIds[l.target]; });
+
+    var edgeKey = {}, deduped = [];
+    ctx.filteredLinks.forEach(function(l) {
+      var k = l.source < l.target ? l.source + '|' + l.target : l.target + '|' + l.source;
+      if (!edgeKey[k]) { edgeKey[k] = { source: l.source, target: l.target, type: l.type, flow: l.flow, label: '', amount: null, _count: 1 }; deduped.push(edgeKey[k]); }
+      else { edgeKey[k]._count++; if (l.amount && (!edgeKey[k].amount || l.amount > edgeKey[k].amount)) edgeKey[k].amount = l.amount; }
+    });
+    deduped.forEach(function(l) { if (l._count > 1) l.label = l._count + ' connections'; });
+    ctx.filteredLinks = deduped;
+  }
+
+  // ═══ FORCE LAYOUT ═══
+  function layoutForce(ctx) {
+    var w = ctx.width, h = ctx.height, fn = ctx.filteredNodes, fl = ctx.filteredLinks;
+    ctx.nodes = fn.map(function(n, i) {
+      var angle = (2 * Math.PI * i) / fn.length;
+      var radius = Math.min(w, h) * 0.35;
+      return Object.assign({}, n, {
+        x: w / 2 + radius * Math.cos(angle) * (0.5 + n.tier * 0.12),
+        y: h / 2 + radius * Math.sin(angle) * (0.5 + n.tier * 0.12), vx: 0, vy: 0
       });
+    });
 
-      // Replace grouped nodes with super-nodes; keep ungrouped nodes
-      var ungroupedNodes = filteredNodes.filter(function(n) { return !groupedNodeIds[n.id]; });
-      filteredNodes = ungroupedNodes.concat(superNodes);
+    var nodeMap = {}; ctx.nodeMap = nodeMap;
+    ctx.nodes.forEach(function(n) { nodeMap[n.id] = n; });
 
-      // Rebuild visibleIds
-      visibleIds = {};
-      filteredNodes.forEach(function(n) { visibleIds[n.id] = true; });
+    var hasSuper = ctx.nodes.some(function(n) { return n._isSuper; });
+    var repulsion = hasSuper ? 28000 : 18000, idealDist = hasSuper ? 240 : 180;
 
-      // Remap edges: grouped node → its super-node
-      filteredLinks = filteredLinks.map(function(l) {
-        var src = nodeToGroup[l.source] || l.source;
-        var tgt = nodeToGroup[l.target] || l.target;
-        return { source: src, target: tgt, type: l.type, flow: l.flow, label: l.label, amount: l.amount };
-      }).filter(function(l) {
-        return l.source !== l.target && visibleIds[l.source] && visibleIds[l.target];
-      });
+    ctx.gaiaCore = null; ctx.maxDeg = 0;
+    var degMap = {};
+    fl.forEach(function(l) { degMap[l.source] = (degMap[l.source] || 0) + 1; degMap[l.target] = (degMap[l.target] || 0) + 1; });
+    ctx.nodes.forEach(function(n) { var d = degMap[n.id] || 0; if (d > ctx.maxDeg) { ctx.maxDeg = d; ctx.gaiaCore = n; } });
 
-      // Deduplicate edges between same pair of super-nodes
-      var edgeKey = {};
-      var deduped = [];
-      filteredLinks.forEach(function(l) {
-        var k = l.source < l.target ? l.source + '|' + l.target : l.target + '|' + l.source;
-        if (!edgeKey[k]) {
-          edgeKey[k] = { source: l.source, target: l.target, type: l.type, flow: l.flow, label: '', amount: null, _count: 1 };
-          deduped.push(edgeKey[k]);
-        } else {
-          edgeKey[k]._count++;
-          if (l.amount && (!edgeKey[k].amount || l.amount > edgeKey[k].amount)) {
-            edgeKey[k].amount = l.amount;
-          }
+    for (var iter = 0; iter < 100; iter++) {
+      for (var i = 0; i < ctx.nodes.length; i++) {
+        for (var j = i + 1; j < ctx.nodes.length; j++) {
+          var dx = ctx.nodes[j].x - ctx.nodes[i].x, dy = ctx.nodes[j].y - ctx.nodes[i].y;
+          var dist = Math.sqrt(dx * dx + dy * dy) || 1;
+          var force = repulsion / (dist * dist);
+          var fx = (dx / dist) * force, fy = (dy / dist) * force;
+          ctx.nodes[i].vx -= fx; ctx.nodes[i].vy -= fy;
+          ctx.nodes[j].vx += fx; ctx.nodes[j].vy += fy;
         }
+      }
+      fl.forEach(function(link) {
+        var s = nodeMap[link.source], t = nodeMap[link.target];
+        if (!s || !t) return;
+        var dx = t.x - s.x, dy = t.y - s.y, dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        var force = (dist - idealDist) * 0.015, fx = (dx / dist) * force, fy = (dy / dist) * force;
+        s.vx += fx; s.vy += fy; t.vx -= fx; t.vy -= fy;
       });
-      deduped.forEach(function(l) {
-        if (l._count > 1) l.label = l._count + ' connections';
+      var gcx = ctx.gaiaCore ? ctx.gaiaCore.x : w / 2, gcy = ctx.gaiaCore ? ctx.gaiaCore.y : h / 2;
+      var baseR = Math.min(w, h) * 0.35;
+      ctx.nodes.forEach(function(n) {
+        if (showSort && bodyLevel >= 1 && n !== ctx.gaiaCore) {
+          var orbitR = baseR * (SORT_RADIUS[n.classification || 'unknown'] || 0.90);
+          var dx = n.x - gcx, dy = n.y - gcy, dist = Math.sqrt(dx * dx + dy * dy) || 1;
+          n.vx += (gcx + (dx / dist) * orbitR - n.x) * 0.003;
+          n.vy += (gcy + (dy / dist) * orbitR - n.y) * 0.003;
+        }
+        n.vx += (w / 2 - n.x) * 0.004; n.vy += (h / 2 - n.y) * 0.004;
+        n.x += n.vx * 0.3; n.y += n.vy * 0.3;
+        n.vx *= 0.78; n.vy *= 0.78;
+        n.x = Math.max(90, Math.min(w - 90, n.x)); n.y = Math.max(50, Math.min(h - 50, n.y));
       });
-      filteredLinks = deduped;
     }
 
-    // ── SVG setup ─────────────────────────────────────────────────────
-    var existingSvg = container.querySelector('svg');
-    if (existingSvg) existingSvg.remove();
+    ctx.adjacency = {};
+    ctx.nodes.forEach(function(n) { ctx.adjacency[n.id] = new Set(); });
+    fl.forEach(function(l) {
+      if (ctx.adjacency[l.source]) ctx.adjacency[l.source].add(l.target);
+      if (ctx.adjacency[l.target]) ctx.adjacency[l.target].add(l.source);
+    });
+  }
 
-    var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.setAttribute('viewBox', '0 0 ' + width + ' ' + height);
-    svg.setAttribute('width', '100%');
-    svg.setAttribute('height', height);
-    svg.setAttribute('role', 'img');
-    svg.setAttribute('aria-label', 'Institutional capture network — ' + filteredNodes.length + ' nodes, ' + filteredLinks.length + ' edges');
-    svg.style.cssText = 'background:rgba(0,0,0,0.02);border-radius:8px;';
-    container.appendChild(svg);
+  // ═══ DRAW HULLS ═══
+  function drawHulls(ctx) {
+    var svg = ctx.svg, nm = ctx.nodeMap;
 
-    // ── Layout (via network-graph-layout.js) ────────────────────────
-    var L = window.NetworkGraphLayout;
-    var nodes;
-    var slingshotGeo = null;
-
-    if (focalLens) {
-      var result = L.slingshot(filteredNodes, filteredLinks, width, height);
-      nodes = result.nodes;
-      slingshotGeo = result;
-
-      // ── Draw slingshot geometry (behind everything) ────────────────
-      var rings = L.slingshotRings(result.maxTier, result.maxRadius);
-      rings.forEach(function(ring) {
-        var c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-        c.setAttribute('cx', result.originX);
-        c.setAttribute('cy', result.originY);
-        c.setAttribute('r', ring.radius);
-        c.setAttribute('fill', 'none');
-        c.setAttribute('stroke', 'rgba(192,132,252,' + ring.opacity + ')');
-        c.setAttribute('stroke-width', '1');
-        c.setAttribute('stroke-dasharray', '4,8');
-        svg.appendChild(c);
-
-        var rLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        rLabel.setAttribute('x', result.originX + ring.radius + 4);
-        rLabel.setAttribute('y', result.originY - 6);
-        rLabel.setAttribute('fill', 'rgba(192,132,252,' + ring.labelOpacity + ')');
-        rLabel.setAttribute('font-size', '8');
-        rLabel.setAttribute('font-style', 'italic');
-        rLabel.textContent = ring.label;
-        svg.appendChild(rLabel);
-      });
-
-      // Origin marker
-      var originDot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-      originDot.setAttribute('cx', result.originX);
-      originDot.setAttribute('cy', result.originY);
-      originDot.setAttribute('r', '4');
-      originDot.setAttribute('fill', '#c084fc');
-      originDot.setAttribute('stroke', 'rgba(192,132,252,0.5)');
-      originDot.setAttribute('stroke-width', '8');
-      originDot.setAttribute('stroke-opacity', '0.15');
-      svg.appendChild(originDot);
-
-      var oLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-      oLabel.setAttribute('x', result.originX);
-      oLabel.setAttribute('y', result.originY - 16);
-      oLabel.setAttribute('text-anchor', 'middle');
-      oLabel.setAttribute('fill', '#c084fc');
-      oLabel.setAttribute('font-size', '10');
-      oLabel.setAttribute('font-weight', '600');
-      oLabel.textContent = 'origin';
-      svg.appendChild(oLabel);
-
-      var edgeLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-      edgeLabel.setAttribute('x', width - 14);
-      edgeLabel.setAttribute('y', height - 14);
-      edgeLabel.setAttribute('text-anchor', 'end');
-      edgeLabel.setAttribute('fill', 'rgba(192,132,252,0.3)');
-      edgeLabel.setAttribute('font-size', '9');
-      edgeLabel.setAttribute('font-style', 'italic');
-      edgeLabel.textContent = 'edges → work unfinished';
-      svg.appendChild(edgeLabel);
-
-      var eqLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-      eqLabel.setAttribute('x', result.originX);
-      eqLabel.setAttribute('y', result.originY + 22);
-      eqLabel.setAttribute('text-anchor', 'middle');
-      eqLabel.setAttribute('fill', 'rgba(192,132,252,0.25)');
-      eqLabel.setAttribute('font-size', '8');
-      eqLabel.textContent = 'r = R × (1 − 1/π^(n/2))';
-      svg.appendChild(eqLabel);
-    } else {
-      nodes = L.forceDirected(filteredNodes, filteredLinks, width, height);
-    }
-
-    var nodeMap = {};
-    nodes.forEach(function(n) { nodeMap[n.id] = n; });
-
-    // ── Build adjacency for hover highlighting ────────────────────────
-    var adjacency = L.buildAdjacency(nodes, filteredLinks);
-
-    var convexHull = L.convexHull;
-
-    // ── Draw ownership hulls (behind everything) ──────────────────────
-    if (showOwnership) {
-      OWNERSHIP_GROUPS.forEach(function(group) {
+    function drawHullGroup(items, padSize) {
+      items.forEach(function(group) {
         var pts = [];
         group.members.forEach(function(mid) {
-          if (nodeMap[mid]) {
-            var n = nodeMap[mid];
-            var pad = 35;
-            pts.push([n.x - pad, n.y - pad]);
-            pts.push([n.x + pad, n.y - pad]);
-            pts.push([n.x - pad, n.y + pad]);
-            pts.push([n.x + pad, n.y + pad]);
+          if (nm[mid]) {
+            var n = nm[mid], p = padSize;
+            pts.push([n.x - p, n.y - p], [n.x + p, n.y - p], [n.x - p, n.y + p], [n.x + p, n.y + p]);
           }
         });
         if (pts.length < 6) return;
         var hull = convexHull(pts);
         var pathD = 'M ' + hull.map(function(p) { return p[0] + ',' + p[1]; }).join(' L ') + ' Z';
-        var hullPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        hullPath.setAttribute('d', pathD);
-        hullPath.setAttribute('fill', group.color);
-        hullPath.setAttribute('stroke', group.stroke);
-        hullPath.setAttribute('stroke-width', '2');
-        hullPath.setAttribute('stroke-dasharray', '6,4');
-
-        var title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-        title.textContent = group.label + '\n' + group.note;
-        hullPath.appendChild(title);
-        svg.appendChild(hullPath);
-
-        // Hull label
-        var cx = 0, cy = 0;
-        hull.forEach(function(p) { cx += p[0]; cy += p[1]; });
-        cx /= hull.length; cy /= hull.length;
-        var hullLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        hullLabel.setAttribute('x', cx);
-        hullLabel.setAttribute('y', cy - (Math.max.apply(null, hull.map(function(p) { return p[1]; })) - cy) - 8);
-        hullLabel.setAttribute('text-anchor', 'middle');
-        hullLabel.setAttribute('fill', group.stroke);
-        hullLabel.setAttribute('font-size', '10');
-        hullLabel.setAttribute('font-weight', '600');
-        hullLabel.setAttribute('font-style', 'italic');
-        hullLabel.textContent = group.label;
-        svg.appendChild(hullLabel);
-      });
-    }
-
-    // ── Draw address overlap hulls ──────────────────────────────────
-    if (showAddress) {
-      ADDRESS_CLUSTERS.forEach(function(cluster) {
-        var pts = [];
-        cluster.members.forEach(function(mid) {
-          if (nodeMap[mid]) {
-            var n = nodeMap[mid];
-            var pad = 30;
-            pts.push([n.x - pad, n.y - pad]);
-            pts.push([n.x + pad, n.y - pad]);
-            pts.push([n.x - pad, n.y + pad]);
-            pts.push([n.x + pad, n.y + pad]);
-          }
-        });
-        if (pts.length < 6) return;
-        var hull = convexHull(pts);
-        var pathD = 'M ' + hull.map(function(p) { return p[0] + ',' + p[1]; }).join(' L ') + ' Z';
-        var hullPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        hullPath.setAttribute('d', pathD);
-        hullPath.setAttribute('fill', cluster.color);
-        hullPath.setAttribute('stroke', cluster.stroke);
-        hullPath.setAttribute('stroke-width', '2');
-        hullPath.setAttribute('stroke-dasharray', '3,3');
-
-        var title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-        title.textContent = cluster.address + '\n' + cluster.note;
-        hullPath.appendChild(title);
-        svg.appendChild(hullPath);
+        var hp = svgEl('path', { d: pathD, fill: group.color, stroke: group.stroke,
+          'stroke-width': '2', 'stroke-dasharray': '6,4' }, svg);
+        var title = svgEl('title', {}, hp); title.textContent = group.label + '\n' + (group.note || group.address || '');
 
         var cx = 0, cy = 0;
         hull.forEach(function(p) { cx += p[0]; cy += p[1]; });
         cx /= hull.length; cy /= hull.length;
         var topY = Math.min.apply(null, hull.map(function(p) { return p[1]; }));
 
-        var addrBg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-        var addrLen = cluster.label.length * 4.5;
-        addrBg.setAttribute('x', cx - addrLen / 2 - 4);
-        addrBg.setAttribute('y', topY - 18);
-        addrBg.setAttribute('width', addrLen + 8);
-        addrBg.setAttribute('height', 14);
-        addrBg.setAttribute('rx', '3');
-        addrBg.setAttribute('fill', 'rgba(0,0,0,0.7)');
-        svg.appendChild(addrBg);
-
-        var addrLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        addrLabel.setAttribute('x', cx);
-        addrLabel.setAttribute('y', topY - 8);
-        addrLabel.setAttribute('text-anchor', 'middle');
-        addrLabel.setAttribute('fill', cluster.stroke);
-        addrLabel.setAttribute('font-size', '9');
-        addrLabel.setAttribute('font-weight', '600');
-        addrLabel.textContent = '📍 ' + cluster.label;
-        svg.appendChild(addrLabel);
-      });
-    }
-
-    // ── Draw cyclic oversight paths (behind nodes, above hulls) ───────
-    if (showCycles) {
-      OVERSIGHT_CYCLES.forEach(function(cycle) {
-        var pts = [];
-        var allVisible = true;
-        cycle.path.forEach(function(nid) {
-          if (!nodeMap[nid]) { allVisible = false; return; }
-          pts.push(nodeMap[nid]);
-        });
-        if (!allVisible || pts.length < 3) return;
-
-        // Draw animated cycle path
-        var pathParts = [];
-        for (var i = 0; i < pts.length; i++) {
-          var from = pts[i];
-          var to = pts[(i + 1) % pts.length];
-          if (i === 0) pathParts.push('M ' + from.x + ',' + from.y);
-          pathParts.push('L ' + to.x + ',' + to.y);
+        if (group.note) {
+          svgText(group.label, { x: cx, y: topY - 8, 'text-anchor': 'middle',
+            fill: group.stroke, 'font-size': '10', 'font-weight': '600', 'font-style': 'italic' }, svg);
         }
-        var cyclePath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        cyclePath.setAttribute('d', pathParts.join(' '));
-        cyclePath.setAttribute('fill', 'none');
-        cyclePath.setAttribute('stroke', '#e67e22');
-        cyclePath.setAttribute('stroke-width', '3');
-        cyclePath.setAttribute('stroke-opacity', '0.7');
-        cyclePath.setAttribute('stroke-dasharray', '8,4');
-        cyclePath.setAttribute('marker-mid', 'url(#cycle-arrow)');
-
-        // Animate the dash
-        var animate = document.createElementNS('http://www.w3.org/2000/svg', 'animate');
-        animate.setAttribute('attributeName', 'stroke-dashoffset');
-        animate.setAttribute('from', '24');
-        animate.setAttribute('to', '0');
-        animate.setAttribute('dur', '1.5s');
-        animate.setAttribute('repeatCount', 'indefinite');
-        cyclePath.appendChild(animate);
-
-        var title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-        title.textContent = cycle.label + '\n' + cycle.note;
-        cyclePath.appendChild(title);
-        svg.appendChild(cyclePath);
-
-        // Cycle label at centroid
-        var cx = 0, cy = 0;
-        pts.forEach(function(p) { cx += p.x; cy += p.y; });
-        cx /= pts.length; cy /= pts.length;
-        var bg = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-        var labelText = cycle.label;
-        bg.setAttribute('x', cx - labelText.length * 3);
-        bg.setAttribute('y', cy - 8);
-        bg.setAttribute('width', labelText.length * 6);
-        bg.setAttribute('height', 14);
-        bg.setAttribute('rx', 3);
-        bg.setAttribute('fill', 'rgba(230,126,34,0.15)');
-        bg.setAttribute('stroke', 'rgba(230,126,34,0.4)');
-        bg.setAttribute('stroke-width', '1');
-        svg.appendChild(bg);
-
-        var cycleLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        cycleLabel.setAttribute('x', cx);
-        cycleLabel.setAttribute('y', cy + 3);
-        cycleLabel.setAttribute('text-anchor', 'middle');
-        cycleLabel.setAttribute('fill', '#e67e22');
-        cycleLabel.setAttribute('font-size', '9');
-        cycleLabel.setAttribute('font-weight', '600');
-        cycleLabel.textContent = cycle.label;
-        svg.appendChild(cycleLabel);
+        if (group.address) {
+          var bg = svgEl('rect', { x: cx - 50, y: topY - 14, width: 100, height: 16, rx: 3,
+            fill: 'rgba(0,0,0,0.6)', stroke: group.stroke, 'stroke-width': '1' }, svg);
+          svgText(group.label, { x: cx, y: topY - 2, 'text-anchor': 'middle',
+            fill: group.stroke, 'font-size': '9', 'font-weight': '600' }, svg);
+        }
       });
-
-      // Add arrow marker definition for cycles
-      var defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
-      var marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
-      marker.setAttribute('id', 'cycle-arrow');
-      marker.setAttribute('viewBox', '0 0 10 10');
-      marker.setAttribute('refX', '5'); marker.setAttribute('refY', '5');
-      marker.setAttribute('markerWidth', '6'); marker.setAttribute('markerHeight', '6');
-      marker.setAttribute('orient', 'auto');
-      var arrowPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      arrowPath.setAttribute('d', 'M 0 0 L 10 5 L 0 10 z');
-      arrowPath.setAttribute('fill', '#e67e22');
-      marker.appendChild(arrowPath);
-      defs.appendChild(marker);
-      svg.insertBefore(defs, svg.firstChild);
     }
+    if (showOwnership) drawHullGroup(OWNERSHIP_GROUPS, 35);
+    if (showAddress) drawHullGroup(ADDRESS_CLUSTERS, 30);
+  }
 
-    // ── Arrow marker definitions for flow directions ────────────────
-    var defs = svg.querySelector('defs') || document.createElementNS('http://www.w3.org/2000/svg', 'defs');
-    if (!defs.parentNode) svg.insertBefore(defs, svg.firstChild);
+  // ═══ DRAW CYCLES ═══
+  function drawCycles(ctx) {
+    if (!showCycles) return;
+    var svg = ctx.svg, nm = ctx.nodeMap;
+    OVERSIGHT_CYCLES.forEach(function(cycle) {
+      var pts = cycle.path.map(function(pid) { return nm[pid]; }).filter(Boolean);
+      if (pts.length < 2) return;
+      pts.push(pts[0]);
+      var pathD = pts.map(function(p, i) { return (i === 0 ? 'M ' : 'L ') + p.x + ',' + p.y; }).join(' ');
+      var cp = svgEl('path', { d: pathD, fill: 'none', stroke: '#e67e22',
+        'stroke-width': '2', 'stroke-dasharray': '8,4', 'stroke-opacity': '0.4' }, svg);
+      var anim = svgEl('animate', { attributeName: 'stroke-dashoffset', from: '0', to: '24',
+        dur: '2s', repeatCount: 'indefinite' }, cp);
+      var title = svgEl('title', {}, cp); title.textContent = cycle.label;
 
-    // Create arrow markers for each flow color
-    Object.keys(FLOW_COLORS).forEach(function(ft) {
-      var marker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
-      marker.setAttribute('id', 'arrow-' + ft);
-      marker.setAttribute('viewBox', '0 0 10 10');
-      marker.setAttribute('refX', '28'); marker.setAttribute('refY', '5');
-      marker.setAttribute('markerWidth', '5'); marker.setAttribute('markerHeight', '5');
-      marker.setAttribute('orient', 'auto');
-      var arrowP = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      arrowP.setAttribute('d', 'M 0 0 L 10 5 L 0 10 z');
-      arrowP.setAttribute('fill', FLOW_COLORS[ft]);
-      arrowP.setAttribute('opacity', '0.8');
-      marker.appendChild(arrowP);
-      defs.appendChild(marker);
+      var cx = pts.reduce(function(s, p) { return s + p.x; }, 0) / pts.length;
+      var cy = pts.reduce(function(s, p) { return s + p.y; }, 0) / pts.length;
+      svgEl('rect', { x: cx - 40, y: cy - 8, width: 80, height: 16, rx: 3,
+        fill: 'rgba(0,0,0,0.7)', stroke: '#e67e22', 'stroke-width': '1' }, svg);
+      svgText(cycle.label, { x: cx, y: cy + 4, 'text-anchor': 'middle',
+        fill: '#e67e22', 'font-size': '9', 'font-weight': '600' }, svg);
     });
-    // Default arrow
-    var defMarker = document.createElementNS('http://www.w3.org/2000/svg', 'marker');
-    defMarker.setAttribute('id', 'arrow-default');
-    defMarker.setAttribute('viewBox', '0 0 10 10');
-    defMarker.setAttribute('refX', '28'); defMarker.setAttribute('refY', '5');
-    defMarker.setAttribute('markerWidth', '4'); defMarker.setAttribute('markerHeight', '4');
-    defMarker.setAttribute('orient', 'auto');
-    var defArrowP = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    defArrowP.setAttribute('d', 'M 0 0 L 10 5 L 0 10 z');
-    defArrowP.setAttribute('fill', '#95a5a6');
-    defArrowP.setAttribute('opacity', '0.5');
-    defMarker.appendChild(defArrowP);
-    defs.appendChild(defMarker);
 
-    // ── Draw links ────────────────────────────────────────────────────
-    var linkElements = [];
-    filteredLinks.forEach(function(link) {
-      var s = nodeMap[link.source];
-      var t = nodeMap[link.target];
+    var defs = svg.querySelector('defs') || svgEl('defs', {});
+    if (!defs.parentNode) svg.insertBefore(defs, svg.firstChild);
+    var marker = svgEl('marker', { id: 'cycle-arrow', viewBox: '0 0 10 10',
+      refX: '10', refY: '5', markerWidth: '6', markerHeight: '6', orient: 'auto' }, defs);
+    var ap = svgEl('path', { d: 'M 0 0 L 10 5 L 0 10 z', fill: '#e67e22', opacity: '0.6' }, marker);
+  }
+
+  // ═══ DRAW ARROWS ═══
+  function drawArrows(ctx) {
+    var svg = ctx.svg;
+    var defs = svg.querySelector('defs') || svgEl('defs', {});
+    if (!defs.parentNode) svg.insertBefore(defs, svg.firstChild);
+    Object.keys(FLOW_COLORS).forEach(function(ft) {
+      var m = svgEl('marker', { id: 'arrow-' + ft, viewBox: '0 0 10 10',
+        refX: '28', refY: '5', markerWidth: '5', markerHeight: '5', orient: 'auto' }, defs);
+      svgEl('path', { d: 'M 0 0 L 10 5 L 0 10 z', fill: FLOW_COLORS[ft], opacity: '0.8' }, m);
+    });
+    var dm = svgEl('marker', { id: 'arrow-default', viewBox: '0 0 10 10',
+      refX: '28', refY: '5', markerWidth: '4', markerHeight: '4', orient: 'auto' }, defs);
+    svgEl('path', { d: 'M 0 0 L 10 5 L 0 10 z', fill: '#95a5a6', opacity: '0.5' }, dm);
+  }
+
+  // ═══ DRAW EDGES ═══
+  function drawEdges(ctx) {
+    ctx.linkElements = [];
+    var svg = ctx.svg, nm = ctx.nodeMap;
+    ctx.filteredLinks.forEach(function(link) {
+      var s = nm[link.source], t = nm[link.target];
       if (!s || !t) return;
-
       var flowActive = activeFlows && link.flow;
       var isFlowMatch = !activeFlows || (activeFlows && activeFlows[link.flow]);
       var useFlowColor = activeFlows && link.flow;
 
-      var line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-      line.setAttribute('x1', s.x); line.setAttribute('y1', s.y);
-      line.setAttribute('x2', t.x); line.setAttribute('y2', t.y);
-
+      var attrs = { x1: s.x, y1: s.y, x2: t.x, y2: t.y };
       if (useFlowColor && isFlowMatch) {
-        line.setAttribute('stroke', FLOW_COLORS[link.flow]);
-        line.setAttribute('stroke-width', '3');
-        line.setAttribute('stroke-opacity', '0.8');
-        line.setAttribute('marker-end', 'url(#arrow-' + link.flow + ')');
+        Object.assign(attrs, { stroke: FLOW_COLORS[link.flow], 'stroke-width': '3', 'stroke-opacity': '0.8', 'marker-end': 'url(#arrow-' + link.flow + ')' });
       } else if (activeFlows && !isFlowMatch) {
-        line.setAttribute('stroke', '#555');
-        line.setAttribute('stroke-width', '1');
-        line.setAttribute('stroke-opacity', '0.1');
+        Object.assign(attrs, { stroke: '#555', 'stroke-width': '1', 'stroke-opacity': '0.1' });
       } else {
-      line.setAttribute('stroke', LINK_COLORS[link.type] || '#95a5a6');
-      line.setAttribute('stroke-width', link.type === 'money' ? '3' : '1.5');
-        line.setAttribute('stroke-opacity', '0.5');
-        if (activeFlows) line.setAttribute('marker-end', 'url(#arrow-default)');
+        Object.assign(attrs, { stroke: LINK_COLORS[link.type] || '#95a5a6',
+          'stroke-width': link.type === 'money' ? '3' : '1.5', 'stroke-opacity': '0.5' });
+        if (activeFlows) attrs['marker-end'] = 'url(#arrow-default)';
       }
-
-      // For aggregated edges (collapsed), make them thicker
+      var line = svgEl('line', attrs, svg);
       if (link._count && link._count > 1) {
-        var currentWidth = parseFloat(line.getAttribute('stroke-width')) || 1.5;
-        line.setAttribute('stroke-width', Math.min(6, currentWidth + Math.log2(link._count)));
+        var cw = parseFloat(line.getAttribute('stroke-width')) || 1.5;
+        line.setAttribute('stroke-width', Math.min(6, cw + Math.log2(link._count)));
       }
+      line.dataset.source = link.source; line.dataset.target = link.target;
+      line.dataset.flow = link.flow || ''; line.dataset.count = link._count || 1;
+      ctx.linkElements.push(line);
 
-      line.dataset.source = link.source;
-      line.dataset.target = link.target;
-      line.dataset.flow = link.flow || '';
-      line.dataset.count = link._count || 1;
-      svg.appendChild(line);
-      linkElements.push(line);
-
-      // Edge count badge for aggregated edges
       if (link._count && link._count > 2) {
-        var mx = (s.x + t.x) / 2;
-        var my = (s.y + t.y) / 2;
-        var eBg = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-        eBg.setAttribute('cx', mx); eBg.setAttribute('cy', my);
-        eBg.setAttribute('r', 8);
-        eBg.setAttribute('fill', 'rgba(0,0,0,0.7)');
-        svg.appendChild(eBg);
-        var eLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        eLabel.setAttribute('x', mx); eLabel.setAttribute('y', my + 3);
-        eLabel.setAttribute('text-anchor', 'middle');
-        eLabel.setAttribute('fill', '#fff');
-        eLabel.setAttribute('font-size', '8');
-        eLabel.setAttribute('font-weight', '700');
-        eLabel.setAttribute('pointer-events', 'none');
-        eLabel.textContent = link._count;
-        svg.appendChild(eLabel);
+        var mx = (s.x + t.x) / 2, my = (s.y + t.y) / 2;
+        svgEl('circle', { cx: mx, cy: my, r: 8, fill: 'rgba(0,0,0,0.7)' }, svg);
+        svgText(link._count, { x: mx, y: my + 3, 'text-anchor': 'middle',
+          fill: '#fff', 'font-size': '8', 'font-weight': '700', 'pointer-events': 'none' }, svg);
       }
     });
+  }
 
-    // ── Compute degree for each node ────────────────────────────────
-    var nodeDegree = L.computeDegrees(nodes, filteredLinks);
+  // ═══ DRAW NODES ═══
+  function drawNodes(ctx) {
+    var svg = ctx.svg, nm = ctx.nodeMap, c = ctx.container, data = ctx.data;
+    var nodeDegree = {};
+    ctx.nodes.forEach(function(n) { nodeDegree[n.id] = 0; });
+    ctx.filteredLinks.forEach(function(l) {
+      if (nodeDegree[l.source] !== undefined) nodeDegree[l.source]++;
+      if (nodeDegree[l.target] !== undefined) nodeDegree[l.target]++;
+    });
 
-    // ── Draw nodes ────────────────────────────────────────────────────
-    var nodeElements = {};
-    nodes.forEach(function(n) {
-      var g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-      g.setAttribute('transform', 'translate(' + n.x + ',' + n.y + ')');
+    ctx.nodeElements = {};
+    ctx.nodes.forEach(function(n) {
+      var g = svgEl('g', { transform: 'translate(' + n.x + ',' + n.y + ')' }, svg);
       g.style.transition = 'opacity 0.2s';
-
       var deg = nodeDegree[n.id] || 0;
-      var isSuper = n._isSuper;
 
-      if (isSuper) {
-        // Super-node: larger, hexagonal feel, click to expand
-        var memberCount = n._memberCount || 1;
-        var r = Math.max(24, Math.min(50, 18 + Math.sqrt(memberCount) * 8));
-        var circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-        circle.setAttribute('r', r);
-        circle.setAttribute('fill', n._color || '#1abc9c');
-        circle.setAttribute('stroke', '#fff');
-        circle.setAttribute('stroke-width', '3');
-        circle.setAttribute('stroke-dasharray', '6,3');
-        circle.style.transition = 'r 0.2s';
-        circle.style.cursor = 'pointer';
-        g.appendChild(circle);
-
-        // Member count badge
-        var badge = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        badge.setAttribute('text-anchor', 'middle');
-        badge.setAttribute('dy', '5');
-        badge.setAttribute('fill', '#fff');
-        badge.setAttribute('font-size', r > 30 ? '14' : '11');
-        badge.setAttribute('font-weight', '700');
-        badge.setAttribute('pointer-events', 'none');
-        badge.textContent = memberCount;
-        g.appendChild(badge);
-
-        // Label
-        var text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        text.setAttribute('dy', -(r + 8));
-        text.setAttribute('text-anchor', 'middle');
-        text.setAttribute('fill', 'currentColor');
-        text.setAttribute('font-size', '11');
-        text.setAttribute('font-weight', '700');
-        text.textContent = n.label;
-        g.appendChild(text);
-
-        var title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-        title.textContent = n.label + ' (' + memberCount + ' nodes)\nClick to expand';
-        g.appendChild(title);
-
+      if (n._isSuper) {
+        var mc = n._memberCount || 1;
+        var r = Math.max(24, Math.min(50, 18 + Math.sqrt(mc) * 8));
+        var circle = svgEl('circle', { r: r, fill: n._color || '#1abc9c', stroke: '#fff',
+          'stroke-width': '3', 'stroke-dasharray': '6,3' }, g);
+        circle.style.transition = 'r 0.2s'; circle.style.cursor = 'pointer';
+        svgText(mc, { 'text-anchor': 'middle', dy: '5', fill: '#fff',
+          'font-size': r > 30 ? '14' : '11', 'font-weight': '700', 'pointer-events': 'none' }, g);
+        svgText(n.label, { dy: -(r + 8), 'text-anchor': 'middle', fill: 'currentColor',
+          'font-size': '11', 'font-weight': '700' }, g);
+        var title = svgEl('title', {}, g); title.textContent = n.label + ' (' + mc + ' nodes)\nClick to expand';
         g.style.cursor = 'pointer';
-        g.addEventListener('click', function(e) {
-          e.stopPropagation();
-          expandedGroups[n.id] = true;
-          renderGraph(container, data);
-        });
-
-        g.addEventListener('mouseenter', function() {
-          highlightNode(n.id);
-          showSuperInfo(n);
-        });
-        g.addEventListener('mouseleave', function() {
-          clearHighlight();
-          hideInfo();
-        });
-
-        nodeElements[n.id] = { group: g, circle: circle, radius: r };
+        g.addEventListener('click', function(e) { e.stopPropagation(); expandedGroups[n.id] = true; renderGraph(c, data); });
+        g.addEventListener('mouseenter', function() { highlightNode(ctx, n.id); showSuperInfo(ctx, n); });
+        g.addEventListener('mouseleave', function() { clearHighlight(ctx); hideInfo(ctx); });
+        ctx.nodeElements[n.id] = { group: g, circle: circle, radius: r };
       } else {
-        // Regular node
-        if (n.url) {
-          g.style.cursor = 'pointer';
-          g.addEventListener('click', function(e) {
-            e.stopPropagation();
-            window.location.href = n.url;
-          });
-        }
-
+        if (n.url) { g.style.cursor = 'pointer'; g.addEventListener('click', function(e) { e.stopPropagation(); window.location.href = n.url; }); }
         var r = Math.max(10, Math.min(32, 10 + Math.sqrt(deg) * 4));
-      var circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-      circle.setAttribute('r', r);
-      circle.setAttribute('fill', COLORS[n.type] || '#95a5a6');
-      circle.setAttribute('stroke', '#fff');
-        circle.setAttribute('stroke-width', r > 20 ? '2.5' : '1.5');
+        if (showSort && n.classification && n.classification !== 'unknown') {
+          var sr = svgEl('circle', { r: r + 4, fill: 'none', stroke: SORT_COLORS[n.classification] || '#7f8c8d',
+            'stroke-width': '3', 'stroke-dasharray': n.classification === 'partial' ? '4,2' : 'none' }, g);
+          sr.style.opacity = String(n.confidence || 0.5);
+        }
+        if (showSort) g.style.opacity = String(n.opacity || 0.25);
+        var circle = svgEl('circle', { r: r, fill: COLORS[n.type] || '#95a5a6', stroke: '#fff',
+          'stroke-width': r > 20 ? '2.5' : '1.5' }, g);
         circle.style.transition = 'r 0.2s, stroke-width 0.2s';
-      g.appendChild(circle);
-
-        if (deg >= 3) {
-          var badge = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-          badge.setAttribute('text-anchor', 'middle');
-          badge.setAttribute('dy', '4');
-          badge.setAttribute('fill', '#fff');
-          badge.setAttribute('font-size', r > 20 ? '11' : '9');
-          badge.setAttribute('font-weight', '700');
-          badge.setAttribute('pointer-events', 'none');
-          badge.textContent = deg;
-          g.appendChild(badge);
-        }
-
-        var labelAbove = deg >= 5;
-      var text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        text.setAttribute('dy', labelAbove ? -(r + 6) : (r + 14));
-      text.setAttribute('text-anchor', 'middle');
-      text.setAttribute('fill', 'currentColor');
-        text.setAttribute('font-size', deg >= 8 ? '12' : (deg >= 3 ? '10' : '9'));
-        text.setAttribute('font-weight', deg >= 8 ? '700' : '500');
-      text.textContent = n.label;
-      g.appendChild(text);
-
-        // If this node belongs to an expanded group, add a collapse hint
-        if (collapseStrategy) {
-          var nodeGroupId = null;
-          Object.keys(expandedGroups).forEach(function(gid) {
-            if (expandedGroups[gid] && n._expandedFrom === gid) nodeGroupId = gid;
-          });
-        }
-
-      var title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-        title.textContent = n.label + ' (' + deg + ' connections)\n' + n.detail;
-      g.appendChild(title);
-
-        g.addEventListener('mouseenter', function() {
-          highlightNode(n.id);
-          showInfo(n);
-        });
-        g.addEventListener('mouseleave', function() {
-          clearHighlight();
-          hideInfo();
-        });
-
-        nodeElements[n.id] = { group: g, circle: circle, radius: r };
+        if (deg >= 3) svgText(deg, { 'text-anchor': 'middle', dy: '4', fill: '#fff',
+          'font-size': r > 20 ? '11' : '9', 'font-weight': '700', 'pointer-events': 'none' }, g);
+        svgText(n.label, { dy: deg >= 5 ? -(r + 6) : (r + 14), 'text-anchor': 'middle', fill: 'currentColor',
+          'font-size': deg >= 8 ? '12' : (deg >= 3 ? '10' : '9'), 'font-weight': deg >= 8 ? '700' : '500' }, g);
+        var titleParts = [n.label + ' (' + deg + ' connections)', n.detail];
+        if (n.classification && n.classification !== 'unknown') {
+          titleParts.push('Sort: ' + n.classification.toUpperCase() + ' (' + Math.round((n.confidence || 0) * 100) + '%)');
+          if (n.sort_note) titleParts.push(n.sort_note);
+        } else if (showSort) titleParts.push('Sort: UNKNOWN — not yet classified');
+        var title = svgEl('title', {}, g); title.textContent = titleParts.join('\n');
+        g.addEventListener('mouseenter', function() { highlightNode(ctx, n.id); showInfo(ctx, n); });
+        g.addEventListener('mouseleave', function() { clearHighlight(ctx); hideInfo(ctx); });
+        ctx.nodeElements[n.id] = { group: g, circle: circle, radius: r };
       }
-
-      svg.appendChild(g);
     });
+  }
 
-    // ── Dynasty highlighting ────────────────────────────────────────
-    if (activeDynasty) {
-      Object.keys(nodeElements).forEach(function(nid) {
-        var n = nodeMap[nid];
-        var el = nodeElements[nid];
-        if (!n) return;
-        if (n.dynasty === activeDynasty) {
-          el.group.style.opacity = '1';
-          el.circle.setAttribute('stroke', DYNASTY_COLORS[activeDynasty]);
-          el.circle.setAttribute('stroke-width', '3');
-        } else {
-          el.group.style.opacity = '0.2';
-        }
-      });
-      linkElements.forEach(function(line) {
-        var sNode = nodeMap[line.dataset.source];
-        var tNode = nodeMap[line.dataset.target];
-        var sMatch = sNode && sNode.dynasty === activeDynasty;
-        var tMatch = tNode && tNode.dynasty === activeDynasty;
-        if (sMatch || tMatch) {
-          line.setAttribute('stroke-opacity', '0.7');
-          line.setAttribute('stroke', DYNASTY_COLORS[activeDynasty]);
-          line.setAttribute('stroke-width', '2.5');
-        } else {
-          line.setAttribute('stroke-opacity', '0.06');
-        }
-      });
+  // ═══ DYNASTY OVERLAY ═══
+  function applyDynasty(ctx) {
+    if (!activeDynasty) return;
+    Object.keys(ctx.nodeElements).forEach(function(nid) {
+      var n = ctx.nodeMap[nid], el = ctx.nodeElements[nid];
+      if (!n) return;
+      if (n.dynasty === activeDynasty) {
+        el.group.style.opacity = '1'; el.circle.setAttribute('stroke', DYNASTY_COLORS[activeDynasty]); el.circle.setAttribute('stroke-width', '3');
+      } else el.group.style.opacity = '0.2';
+    });
+    ctx.linkElements.forEach(function(line) {
+      var sn = ctx.nodeMap[line.dataset.source], tn = ctx.nodeMap[line.dataset.target];
+      if ((sn && sn.dynasty === activeDynasty) || (tn && tn.dynasty === activeDynasty)) {
+        line.setAttribute('stroke-opacity', '0.7'); line.setAttribute('stroke', DYNASTY_COLORS[activeDynasty]); line.setAttribute('stroke-width', '2.5');
+      } else line.setAttribute('stroke-opacity', '0.06');
+    });
+  }
+
+  // ═══ HIGHLIGHT ═══
+  function highlightNode(ctx, id) {
+    var neighbors = ctx.adjacency[id] || new Set();
+    Object.keys(ctx.nodeElements).forEach(function(nid) {
+      var el = ctx.nodeElements[nid];
+      if (nid === id) { el.group.style.opacity = '1'; el.circle.setAttribute('stroke-width', '4'); el.circle.setAttribute('r', el.radius + 4); }
+      else if (neighbors.has(nid)) { el.group.style.opacity = '1'; el.circle.setAttribute('stroke-width', '3'); }
+      else el.group.style.opacity = '0.15';
+    });
+    ctx.linkElements.forEach(function(line) {
+      if (line.dataset.source === id || line.dataset.target === id) {
+        line.setAttribute('stroke-opacity', '0.9');
+        line.setAttribute('stroke-width', line.getAttribute('stroke-width') === '3' ? '4' : '3');
+      } else line.setAttribute('stroke-opacity', '0.08');
+    });
+  }
+
+  function clearHighlight(ctx) {
+    Object.keys(ctx.nodeElements).forEach(function(nid) {
+      var el = ctx.nodeElements[nid];
+      el.group.style.opacity = '1'; el.circle.setAttribute('stroke-width', el.radius > 20 ? '2.5' : '1.5'); el.circle.setAttribute('r', el.radius);
+    });
+    ctx.linkElements.forEach(function(line) {
+      line.setAttribute('stroke-opacity', '0.5');
+      line.setAttribute('stroke-width', line.getAttribute('stroke') === LINK_COLORS.money ? '3' : '1.5');
+    });
+  }
+
+  // ═══ INFO PANEL ═══
+  function ensureInfoPanel(ctx) {
+    var ip = ctx.container.querySelector('.graph-info');
+    if (!ip) {
+      ip = document.createElement('div');
+      ip.className = 'graph-info';
+      ip.style.cssText = 'position:absolute;top:12px;right:12px;background:rgba(0,0,0,0.85);color:#fff;padding:12px 16px;border-radius:8px;font-size:12px;max-width:280px;pointer-events:none;opacity:0;transition:opacity 0.2s;z-index:10;line-height:1.5;';
+      ctx.container.style.position = 'relative';
+      ctx.container.appendChild(ip);
+    }
+    ctx.infoPanel = ip;
+  }
+
+  function showInfo(ctx, n) {
+    var connCount = (ctx.adjacency[n.id] || new Set()).size;
+    var nexusStr = (n.nexus && n.nexus.length) ? n.nexus.map(function(x) {
+      return '<span style="color:' + NEXUS_COLORS[x] + '">' + x + '</span>';
+    }).join(' · ') : 'none';
+
+    var extras = '';
+    OWNERSHIP_GROUPS.forEach(function(g) { if (g.members.indexOf(n.id) !== -1) extras += '<br><span style="color:#e74c3c;font-size:10px;">⬡ ' + g.note + '</span>'; });
+    ADDRESS_CLUSTERS.forEach(function(a) { if (a.members.indexOf(n.id) !== -1) extras += '<br><span style="color:#d35400;font-size:10px;">📍 ' + a.address + ' (' + a.members.length + ' entities)</span>'; });
+    OVERSIGHT_CYCLES.forEach(function(c) { if (c.path.indexOf(n.id) !== -1) extras += '<br><span style="color:#e67e22;font-size:10px;">⟳ ' + c.label + '</span>'; });
+
+    var flowIn = { money:0, power:0, influence:0, position:0 }, flowOut = { money:0, power:0, influence:0, position:0 };
+    ctx.filteredLinks.forEach(function(l) {
+      if (l.flow) { if (l.target === n.id && flowIn[l.flow] !== undefined) flowIn[l.flow]++; if (l.source === n.id && flowOut[l.flow] !== undefined) flowOut[l.flow]++; }
+    });
+    var flowParts = [];
+    Object.keys(FLOW_COLORS).forEach(function(ft) {
+      if (flowIn[ft] || flowOut[ft]) {
+        var parts = []; if (flowIn[ft]) parts.push(flowIn[ft] + ' in'); if (flowOut[ft]) parts.push(flowOut[ft] + ' out');
+        flowParts.push('<span style="color:' + FLOW_COLORS[ft] + '">' + FLOW_ICONS[ft] + ' ' + ft + ': ' + parts.join(', ') + '</span>');
+      }
+    });
+    var flowStr = flowParts.length ? '<br>' + flowParts.join(' · ') : '';
+
+    var sortStr = '';
+    if (n.classification && n.classification !== 'unknown') {
+      sortStr = '<br><span style="color:' + (SORT_COLORS[n.classification] || '#7f8c8d') + ';font-size:10px;font-weight:600">◉ ' +
+        n.classification.toUpperCase() + ' (' + Math.round((n.confidence || 0) * 100) + '%)</span>';
+      if (n.sort_note) sortStr += '<br><span style="font-size:10px;opacity:0.6">' + n.sort_note + '</span>';
     }
 
-    // ── Hover highlighting ────────────────────────────────────────────
-    function highlightNode(id) {
-      var neighbors = adjacency[id] || new Set();
-      Object.keys(nodeElements).forEach(function(nid) {
-        var el = nodeElements[nid];
-        if (nid === id) {
-          el.group.style.opacity = '1';
-          el.circle.setAttribute('stroke-width', '4');
-          el.circle.setAttribute('r', el.radius + 4);
-        } else if (neighbors.has(nid)) {
-          el.group.style.opacity = '1';
-          el.circle.setAttribute('stroke-width', '3');
-        } else {
-          el.group.style.opacity = '0.15';
-        }
-      });
-      linkElements.forEach(function(line) {
-        if (line.dataset.source === id || line.dataset.target === id) {
-          line.setAttribute('stroke-opacity', '0.9');
-          line.setAttribute('stroke-width', line.getAttribute('stroke-width') === '3' ? '4' : '3');
-        } else {
-          line.setAttribute('stroke-opacity', '0.08');
-        }
-      });
-    }
+    ctx.infoPanel.innerHTML = '<strong>' + n.label + '</strong> (' + connCount + ')<br>' +
+      '<span style="font-size:10px;opacity:0.6">' + n.detail + '</span><br>' +
+      '<span style="font-size:10px">Nexus: ' + nexusStr + '</span>' +
+      extras + flowStr + sortStr;
+    ctx.infoPanel.style.opacity = '1';
+  }
 
-    function clearHighlight() {
-      Object.keys(nodeElements).forEach(function(nid) {
-        var el = nodeElements[nid];
-        el.group.style.opacity = '1';
-        el.circle.setAttribute('stroke-width', el.radius > 20 ? '2.5' : '1.5');
-        el.circle.setAttribute('r', el.radius);
-      });
-      linkElements.forEach(function(line) {
-        line.setAttribute('stroke-opacity', '0.5');
-        var isMoney = line.getAttribute('stroke') === LINK_COLORS.money;
-        line.setAttribute('stroke-width', isMoney ? '3' : '1.5');
-      });
-    }
+  function showSuperInfo(ctx, n) {
+    ctx.infoPanel.innerHTML = '<strong>' + n.label + '</strong><br>' +
+      '<span style="font-size:10px;">' + (n._memberCount || '?') + ' members</span><br>' +
+      '<span style="font-size:10px;opacity:0.6">' + (n.detail || '') + '</span><br>' +
+      '<span style="font-size:10px;color:#58a6ff">Click to expand</span>';
+    ctx.infoPanel.style.opacity = '1';
+  }
 
-    // ── Info panel on hover ───────────────────────────────────────────
-    var infoPanel = container.querySelector('.graph-info');
-    if (!infoPanel) {
-      infoPanel = document.createElement('div');
-      infoPanel.className = 'graph-info';
-      infoPanel.style.cssText = 'position:absolute;top:12px;right:12px;background:rgba(0,0,0,0.85);' +
-        'color:#fff;padding:12px 16px;border-radius:8px;font-size:12px;max-width:280px;' +
-        'pointer-events:none;opacity:0;transition:opacity 0.2s;z-index:10;line-height:1.5;';
-      container.style.position = 'relative';
-      container.appendChild(infoPanel);
-    }
+  function hideInfo(ctx) { ctx.infoPanel.style.opacity = '0'; }
 
-    function showInfo(n) {
-      var connCount = (adjacency[n.id] || new Set()).size;
-      var nexusStr = (n.nexus && n.nexus.length) ? n.nexus.map(function(x) {
-        return '<span style="color:' + NEXUS_COLORS[x] + '">' + x + '</span>';
-      }).join(' · ') : 'none';
+  // ═══ LEGEND ═══
+  function drawLegend(ctx) {
+    var svg = ctx.svg, w = ctx.width, h = ctx.height, y = 20;
 
-      // Find ownership groups containing this node
-      var ownershipInfo = '';
-      OWNERSHIP_GROUPS.forEach(function(g) {
-        if (g.members.indexOf(n.id) !== -1) {
-          ownershipInfo += '<br><span style="color:#e74c3c;font-size:10px;">⬡ ' + g.note + '</span>';
-        }
-      });
-
-      // Find address clusters containing this node
-      var addressInfo = '';
-      ADDRESS_CLUSTERS.forEach(function(a) {
-        if (a.members.indexOf(n.id) !== -1) {
-          addressInfo += '<br><span style="color:#d35400;font-size:10px;">📍 ' + a.address + ' (' + a.members.length + ' entities)</span>';
-        }
-      });
-
-      // Find cycles containing this node
-      var cycleInfo = '';
-      OVERSIGHT_CYCLES.forEach(function(c) {
-        if (c.path.indexOf(n.id) !== -1) {
-          cycleInfo += '<br><span style="color:#e67e22;font-size:10px;">⟳ ' + c.label + '</span>';
-        }
-      });
-
-      // Flow summary — what flows IN and OUT of this node
-      var flowIn = { money: 0, power: 0, influence: 0, position: 0 };
-      var flowOut = { money: 0, power: 0, influence: 0, position: 0 };
-      filteredLinks.forEach(function(l) {
-        if (l.flow) {
-          if (l.target === n.id && flowIn[l.flow] !== undefined) flowIn[l.flow]++;
-          if (l.source === n.id && flowOut[l.flow] !== undefined) flowOut[l.flow]++;
-        }
-      });
-      var flowParts = [];
-      Object.keys(FLOW_COLORS).forEach(function(ft) {
-        if (flowIn[ft] || flowOut[ft]) {
-          var parts = [];
-          if (flowIn[ft]) parts.push(flowIn[ft] + ' in');
-          if (flowOut[ft]) parts.push(flowOut[ft] + ' out');
-          flowParts.push('<span style="color:' + FLOW_COLORS[ft] + '">' +
-            FLOW_ICONS[ft] + ' ' + ft + ': ' + parts.join(', ') + '</span>');
-        }
-      });
-      var flowInfo = flowParts.length ?
-        '<br><span style="font-size:10px;">' + flowParts.join(' · ') + '</span>' : '';
-
-      infoPanel.innerHTML = '<strong style="font-size:14px;">' + n.label + '</strong><br>' +
-        '<span style="opacity:0.7">' + n.detail + '</span><br>' +
-        '<span style="opacity:0.5;font-size:10px;">' + connCount + ' connections · Nexus: ' + nexusStr + '</span>' +
-        flowInfo + ownershipInfo + addressInfo + cycleInfo +
-        (n.url ? '<br><span style="opacity:0.4;font-size:10px;">Click to view page →</span>' : '');
-      infoPanel.style.opacity = '1';
-    }
-
-    function showSuperInfo(n) {
-      if (!n._isSuper) return showInfo(n);
-      var members = n._members || [];
-      var memberLabels = members.slice(0, 8).map(function(mid) {
-        var found = data.nodes.find(function(nd) { return nd.id === mid; });
-        return found ? found.label : mid;
-      });
-      if (members.length > 8) memberLabels.push('... +' + (members.length - 8) + ' more');
-
-      infoPanel.innerHTML = '<strong style="font-size:14px;color:' + (n._color || '#1abc9c') + ';">' + n.label + '</strong><br>' +
-        '<span style="opacity:0.7">' + members.length + ' nodes collapsed</span><br>' +
-        '<span style="font-size:10px;opacity:0.6;">' + memberLabels.join(', ') + '</span><br>' +
-        '<span style="opacity:0.4;font-size:10px;">Click to expand ↗</span>';
-      infoPanel.style.opacity = '1';
-    }
-
-    function hideInfo() {
-      infoPanel.style.opacity = '0';
-    }
-
-    // ── Legend ─────────────────────────────────────────────────────────
-    var legendY = 20;
     var legend = [
       { color: COLORS.actor, label: 'Enterprise principals' },
       { color: COLORS.judge, label: 'Judicial cover' },
@@ -1097,149 +669,190 @@
       { color: COLORS.institutional, label: 'Institutional (FOIA)' },
     ];
     legend.forEach(function(item) {
-      var c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-      c.setAttribute('cx', 20); c.setAttribute('cy', legendY);
-      c.setAttribute('r', 6); c.setAttribute('fill', item.color);
-      svg.appendChild(c);
-      var t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-      t.setAttribute('x', 32); t.setAttribute('y', legendY + 4);
-      t.setAttribute('fill', 'currentColor'); t.setAttribute('font-size', '10');
-      t.setAttribute('font-weight', '500');
-      t.textContent = item.label;
-      svg.appendChild(t);
-      legendY += 20;
+      svgEl('circle', { cx: 20, cy: y, r: 6, fill: item.color }, svg);
+      svgText(item.label, { x: 32, y: y + 4, fill: 'currentColor', 'font-size': '10', 'font-weight': '500' }, svg);
+      y += 20;
     });
 
-    // Flow legend when active
     if (activeFlows) {
-      legendY += 8;
+      y += 8;
       Object.keys(FLOW_COLORS).forEach(function(ft) {
-        if (activeFlows[ft]) {
-          var fl = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-          fl.setAttribute('x1', 14); fl.setAttribute('y1', legendY);
-          fl.setAttribute('x2', 26); fl.setAttribute('y2', legendY);
-          fl.setAttribute('stroke', FLOW_COLORS[ft]);
-          fl.setAttribute('stroke-width', '3');
-          fl.setAttribute('marker-end', 'url(#arrow-' + ft + ')');
-          svg.appendChild(fl);
-          var ftText = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-          ftText.setAttribute('x', 32); ftText.setAttribute('y', legendY + 4);
-          ftText.setAttribute('fill', FLOW_COLORS[ft]); ftText.setAttribute('font-size', '10');
-          ftText.setAttribute('font-weight', '600');
-          ftText.textContent = FLOW_ICONS[ft] + ' ' + ft.charAt(0).toUpperCase() + ft.slice(1);
-          svg.appendChild(ftText);
-          legendY += 20;
-        }
+        if (!activeFlows[ft]) return;
+        svgEl('line', { x1: 14, y1: y, x2: 26, y2: y, stroke: FLOW_COLORS[ft], 'stroke-width': '3', 'marker-end': 'url(#arrow-' + ft + ')' }, svg);
+        svgText(FLOW_ICONS[ft] + ' ' + ft.charAt(0).toUpperCase() + ft.slice(1),
+          { x: 32, y: y + 4, fill: FLOW_COLORS[ft], 'font-size': '10', 'font-weight': '600' }, svg);
+        y += 20;
       });
     }
 
-    // Layer legend additions
-    if (showOwnership || showAddress || showCycles) {
-      legendY += 8;
+    if (showAddress || showOwnership || showCycles) {
+      y += 8;
       if (showAddress) {
-        var ac = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-        ac.setAttribute('x', 14); ac.setAttribute('y', legendY - 5);
-        ac.setAttribute('width', 12); ac.setAttribute('height', 10);
-        ac.setAttribute('rx', 2);
-        ac.setAttribute('fill', 'rgba(211,84,0,0.15)');
-        ac.setAttribute('stroke', 'rgba(211,84,0,0.6)');
-        ac.setAttribute('stroke-width', '1.5');
-        ac.setAttribute('stroke-dasharray', '3,3');
-        svg.appendChild(ac);
-        var at = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        at.setAttribute('x', 32); at.setAttribute('y', legendY + 4);
-        at.setAttribute('fill', 'currentColor'); at.setAttribute('font-size', '10');
-        at.setAttribute('font-weight', '500');
-        at.textContent = 'Shared address (' + ADDRESS_CLUSTERS.length + ' clusters)';
-        svg.appendChild(at);
-        legendY += 20;
+        svgEl('rect', { x: 14, y: y - 5, width: 12, height: 10, rx: 2, fill: 'rgba(211,84,0,0.15)', stroke: 'rgba(211,84,0,0.6)', 'stroke-width': '1.5', 'stroke-dasharray': '3,3' }, svg);
+        svgText('Shared address (' + ADDRESS_CLUSTERS.length + ' clusters)', { x: 32, y: y + 4, fill: 'currentColor', 'font-size': '10', 'font-weight': '500' }, svg);
+        y += 20;
       }
       if (showOwnership) {
-        var oc = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-        oc.setAttribute('x', 14); oc.setAttribute('y', legendY - 5);
-        oc.setAttribute('width', 12); oc.setAttribute('height', 10);
-        oc.setAttribute('rx', 2);
-        oc.setAttribute('fill', 'rgba(192,57,43,0.15)');
-        oc.setAttribute('stroke', 'rgba(192,57,43,0.5)');
-        oc.setAttribute('stroke-width', '1.5');
-        oc.setAttribute('stroke-dasharray', '3,2');
-        svg.appendChild(oc);
-        var ot = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        ot.setAttribute('x', 32); ot.setAttribute('y', legendY + 4);
-        ot.setAttribute('fill', 'currentColor'); ot.setAttribute('font-size', '10');
-        ot.setAttribute('font-weight', '500');
-        ot.textContent = 'Ownership hull';
-        svg.appendChild(ot);
-        legendY += 20;
+        svgEl('rect', { x: 14, y: y - 5, width: 12, height: 10, rx: 2, fill: 'rgba(192,57,43,0.15)', stroke: 'rgba(192,57,43,0.5)', 'stroke-width': '1.5', 'stroke-dasharray': '3,2' }, svg);
+        svgText('Ownership hull', { x: 32, y: y + 4, fill: 'currentColor', 'font-size': '10', 'font-weight': '500' }, svg);
+        y += 20;
       }
       if (showCycles) {
-        var cl = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-        cl.setAttribute('x1', 14); cl.setAttribute('y1', legendY);
-        cl.setAttribute('x2', 26); cl.setAttribute('y2', legendY);
-        cl.setAttribute('stroke', '#e67e22');
-        cl.setAttribute('stroke-width', '2');
-        cl.setAttribute('stroke-dasharray', '4,2');
-        svg.appendChild(cl);
-        var ct = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-        ct.setAttribute('x', 32); ct.setAttribute('y', legendY + 4);
-        ct.setAttribute('fill', 'currentColor'); ct.setAttribute('font-size', '10');
-        ct.setAttribute('font-weight', '500');
-        ct.textContent = 'Cyclic "oversight"';
-        svg.appendChild(ct);
-        legendY += 20;
+        svgEl('line', { x1: 14, y1: y, x2: 26, y2: y, stroke: '#e67e22', 'stroke-width': '2', 'stroke-dasharray': '4,2' }, svg);
+        svgText('Cyclic "oversight"', { x: 32, y: y + 4, fill: 'currentColor', 'font-size': '10', 'font-weight': '500' }, svg);
+        y += 20;
       }
     }
 
-    // Node count summary
-    var countText = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-    countText.setAttribute('x', width - 10); countText.setAttribute('y', height - 10);
-    countText.setAttribute('text-anchor', 'end');
-    countText.setAttribute('fill', 'currentColor'); countText.setAttribute('font-size', '10');
-    countText.setAttribute('opacity', '0.4');
+    if (showSort) {
+      y += 8;
+      svgText('Epitope Sort:', { x: 20, y: y + 4, fill: '#e67e22', 'font-size': '10', 'font-weight': '700' }, svg);
+      y += 18;
+      var sortLegend = [
+        { cls: 'non-self', label: 'Non-self (capture)' }, { cls: 'self', label: 'Self (functioning)' },
+        { cls: 'null', label: 'Null (routing)' }, { cls: 'partial', label: 'Partial capture' },
+        { cls: 'other', label: 'Other (insufficient data)' }, { cls: 'unknown', label: 'Unknown — not yet sorted' },
+      ];
+      sortLegend.forEach(function(item) {
+        var sc = svgEl('circle', { cx: 20, cy: y, r: 5, fill: 'none', stroke: SORT_COLORS[item.cls], 'stroke-width': '2' }, svg);
+        if (item.cls === 'partial') sc.setAttribute('stroke-dasharray', '3,1');
+        if (item.cls === 'unknown') sc.style.opacity = '0.25';
+        var st = svgText(item.label, { x: 32, y: y + 4, fill: 'currentColor', 'font-size': '10', 'font-weight': '500' }, svg);
+        if (item.cls === 'unknown') st.style.opacity = '0.5';
+        y += 18;
+      });
+      var sortedCount = ctx.filteredNodes.filter(function(n) { return n.classification && n.classification !== 'unknown'; }).length;
+      var st = svgText(sortedCount + '/' + ctx.filteredNodes.length + ' sorted', { x: 20, y: y + 4, fill: 'currentColor', 'font-size': '9' }, svg);
+      st.style.opacity = '0.5';
+      y += 20;
+    }
+  }
+
+  // ═══ MOON ORBITS + π PANEL ═══
+  function drawObservation(ctx) {
+    var svg = ctx.svg, w = ctx.width, h = ctx.height;
+
+    if (showSort && ctx.gaiaCore) {
+      var gcx = ctx.gaiaCore.x, gcy = ctx.gaiaCore.y, baseR = Math.min(w, h) * 0.35;
+      ['non-self','partial','null','self','other'].forEach(function(cls) {
+        var ring = svgEl('circle', { cx: gcx, cy: gcy, r: baseR * (SORT_RADIUS[cls] || 0.90),
+          fill: 'none', stroke: SORT_COLORS[cls] || '#7f8c8d', 'stroke-width': '0.5', 'stroke-opacity': '0.15', 'stroke-dasharray': '4,4' });
+        svg.insertBefore(ring, svg.firstChild);
+      });
+      svgEl('circle', { cx: gcx, cy: gcy, r: 3, fill: '#e74c3c', opacity: '0.4' }, svg);
+    }
+
+    if (showSort) {
+      var piSorted = ctx.filteredNodes.filter(function(n) { return n.classification && n.classification !== 'unknown'; }).length;
+      var piTotal = ctx.filteredNodes.length, piRatio = piTotal > 0 ? piSorted / piTotal : 0, piTarget = 1 / Math.PI;
+      var piY = h - 80, piG = svgEl('g', {}, svg);
+      var bl = bodyLevel === 0 ? '0-body: raw' : bodyLevel === 1 ? '1-body: sorted' : '2-body: observed';
+      svgText(bl, { x: w - 10, y: piY, 'text-anchor': 'end', fill: 'currentColor', 'font-size': '9', opacity: '0.5' }, piG);
+      svgText(piSorted + '/' + piTotal + ' sorted · π=' + piRatio.toFixed(3) + (piRatio > piTarget ? ' ✓' : ' → 1/π=' + piTarget.toFixed(3)),
+        { x: w - 10, y: piY + 14, 'text-anchor': 'end', fill: piRatio > piTarget ? '#27ae60' : '#f39c12', 'font-size': '10', 'font-weight': '600' }, piG);
+      var counts = { 'non-self': 0, 'null': 0, 'self': 0, 'partial': 0, 'other': 0 };
+      ctx.filteredNodes.forEach(function(n) { var c = n.classification || 'unknown'; if (counts[c] !== undefined) counts[c]++; });
+      svgText('non-self:' + counts['non-self'] + ' null:' + counts['null'] + ' self:' + counts['self'] + ' partial:' + counts['partial'] + ' other:' + counts['other'],
+        { x: w - 10, y: piY + 28, 'text-anchor': 'end', fill: 'currentColor', 'font-size': '9', opacity: '0.4' }, piG);
+      if (ctx.gaiaCore) {
+        svgText('gaia core: ' + (ctx.gaiaCore.label || ctx.gaiaCore.id) + ' (' + ctx.maxDeg + ' edges)',
+          { x: w - 10, y: piY + 42, 'text-anchor': 'end', fill: '#e74c3c', 'font-size': '9', opacity: '0.5' }, piG);
+      }
+    }
+  }
+
+  // ═══ SUMMARY ═══
+  function drawSummary(ctx) {
+    var w = ctx.width, h = ctx.height;
     var layerInfo = [];
     if (showOwnership) layerInfo.push(OWNERSHIP_GROUPS.length + ' ownership groups');
     if (showAddress) layerInfo.push(ADDRESS_CLUSTERS.length + ' address clusters');
     if (showCycles) layerInfo.push(OVERSIGHT_CYCLES.length + ' cycles');
     if (activeFlows) {
-      var flowCounts = {};
-      filteredLinks.forEach(function(l) {
-        if (l.flow && activeFlows[l.flow]) flowCounts[l.flow] = (flowCounts[l.flow] || 0) + 1;
-      });
-      var fc = Object.keys(flowCounts).map(function(f) { return flowCounts[f] + ' ' + f; });
-      if (fc.length) layerInfo.push(fc.join(', '));
+      var fc = {};
+      ctx.filteredLinks.forEach(function(l) { if (l.flow && activeFlows[l.flow]) fc[l.flow] = (fc[l.flow] || 0) + 1; });
+      var fcs = Object.keys(fc).map(function(f) { return fc[f] + ' ' + f; });
+      if (fcs.length) layerInfo.push(fcs.join(', '));
     }
     if (collapseStrategy) {
-      var superCount = filteredNodes.filter(function(n) { return n._isSuper; }).length;
-      var totalOriginal = data.nodes.length;
-      layerInfo.push('collapsed: ' + superCount + ' groups from ' + totalOriginal + ' nodes');
+      var superCount = ctx.filteredNodes.filter(function(n) { return n._isSuper; }).length;
+      layerInfo.push('collapsed: ' + superCount + ' groups from ' + ctx.data.nodes.length + ' nodes');
     }
-    countText.textContent = filteredNodes.length + ' nodes · ' + filteredLinks.length + ' edges' +
-      (layerInfo.length ? ' · ' + layerInfo.join(' · ') : '');
-    svg.appendChild(countText);
+    if (showSort) {
+      var sc = ctx.filteredNodes.filter(function(n) { return n.classification && n.classification !== 'unknown'; }).length;
+      layerInfo.push(sc + ' sorted / ' + (ctx.filteredNodes.length - sc) + ' proximate');
+    }
+    svgText(ctx.filteredNodes.length + ' nodes · ' + ctx.filteredLinks.length + ' edges' + (layerInfo.length ? ' · ' + layerInfo.join(' · ') : ''),
+      { x: w - 10, y: h - 10, 'text-anchor': 'end', fill: 'currentColor', 'font-size': '10', opacity: '0.4' }, ctx.svg);
   }
 
-  // ── Initialize ────────────────────────────────────────────────────────
+  // ═══ RENDER GRAPH — DISPATCHER ═══
+  function renderGraph(container, data) {
+    var ctx = {
+      container: container, data: data,
+      width: container.clientWidth || 800,
+      height: Math.max(700, (container.clientWidth || 800) * 0.75)
+    };
 
+    buildControls(ctx);
+    filterAndCollapse(ctx);
+
+    var existingSvg = container.querySelector('svg');
+    if (existingSvg) existingSvg.remove();
+    ctx.svg = svgEl('svg', { viewBox: '0 0 ' + ctx.width + ' ' + ctx.height,
+      width: '100%', height: ctx.height, role: 'img',
+      'aria-label': 'Institutional capture network — ' + ctx.filteredNodes.length + ' nodes, ' + ctx.filteredLinks.length + ' edges' });
+    ctx.svg.style.cssText = 'background:rgba(0,0,0,0.02);border-radius:8px;';
+    container.appendChild(ctx.svg);
+
+    layoutForce(ctx);
+    drawHulls(ctx);
+    drawCycles(ctx);
+    drawArrows(ctx);
+    drawEdges(ctx);
+    drawNodes(ctx);
+    applyDynasty(ctx);
+    ensureInfoPanel(ctx);
+    drawLegend(ctx);
+    drawObservation(ctx);
+    drawSummary(ctx);
+  }
+
+  // ═══ CLASSIFICATION ═══
+  function applyClassification(data) {
+    if (!classificationData || !classificationData.entities) return data;
+    data.nodes.forEach(function(n) {
+      var entry = classificationData.entities[n.id];
+      if (entry) {
+        n.classification = entry.classification; n.confidence = entry.confidence;
+        n.opacity = Math.max(0.25, entry.confidence || 0);
+        n.sort_pass = entry.sort_pass; n.sort_method = entry.method;
+        if (entry.note) n.sort_note = entry.note;
+      }
+    });
+    bodyLevel = 1;
+    var sorted = data.nodes.filter(function(n) { return n.classification && n.classification !== 'unknown'; }).length;
+    if (sorted > data.nodes.length * 0.3) bodyLevel = 2;
+    return data;
+  }
+
+  // ═══ INIT ═══
   function init() {
     var container = document.getElementById('network-graph');
     if (!container) return;
-
-    // Data priority: shared data layer → API → error
-    if (DN.nodes && DN.edges) {
-      renderGraph(container, DN.graphData());
-      return;
-    }
-    fetch('/api/public-record/network')
-      .then(function(r) { return r.ok ? r.json() : Promise.reject('no API'); })
-      .then(function(data) { renderGraph(container, data); })
-      .catch(function() {
-        container.innerHTML = '<p style="color:#e74c3c;">Network data not loaded. Ensure network-data.js is included before network-graph.js.</p>';
+    fetch('/classification.json')
+      .then(function(r) { return r.ok ? r.json() : null; })
+      .then(function(cls) { classificationData = cls; })
+      .catch(function() { classificationData = null; })
+      .finally(function() {
+        if (DN.nodes && DN.edges) { renderGraph(container, applyClassification(DN.graphData())); return; }
+        fetch('/api/public-record/network')
+          .then(function(r) { return r.ok ? r.json() : Promise.reject('no API'); })
+          .then(function(data) { renderGraph(container, applyClassification(data)); })
+          .catch(function() { container.innerHTML = '<p style="color:#e74c3c;">Network data not loaded. Ensure network-data.js is included before network-graph.js.</p>'; });
       });
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
-    init();
-  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
 })();
