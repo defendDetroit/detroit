@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Detroit Institutional Capture — Network Graph</title>
+<meta name="description" content="Interactive network graph documenting institutional capture in Detroit. 87+ nodes, 120+ edges. Every connection sourced to public records.">
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0d1117; color: #c9d1d9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+  header { padding: 1rem 2rem; border-bottom: 1px solid #21262d; }
+  header h1 { font-size: 1.4rem; font-weight: 600; }
+  header h1 a { color: #58a6ff; text-decoration: none; }
+  header p { color: #8b949e; font-size: 0.85rem; margin-top: 0.3rem; }
+  nav { padding: 0.6rem 2rem; background: #161b22; border-bottom: 1px solid #21262d; display: flex; gap: 1.5rem; flex-wrap: wrap; }
+  nav a { color: #58a6ff; text-decoration: none; font-size: 0.85rem; }
+  nav a:hover { text-decoration: underline; }
+  #network-container { width: 100%; height: calc(100vh - 120px); }
+  #network-container svg { width: 100%; height: 100%; }
+  .info { padding: 2rem; max-width: 60rem; }
+  .info h2 { margin-bottom: 0.5rem; }
+  .info p { color: #8b949e; line-height: 1.6; }
+  footer { padding: 1rem 2rem; border-top: 1px solid #21262d; color: #484f58; font-size: 0.75rem; text-align: center; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><a href="https://defenddetroit.github.io/publicRecord/">defendDetroit</a> / detroit</h1>
+  <p>Institutional capture network — interactive force-directed graph. Every node sourced to public records.</p>
+</header>
+
+<nav>
+  <a href="https://defenddetroit.github.io/publicRecord/">publicRecord (full site)</a>
+  <a href="https://amicuscontra.github.io/tuebor/">tuebor (statewide)</a>
+  <a href="https://amicuscontra.github.io/clutch/">clutch (investigations)</a>
+  <a href="https://amicuscontra.github.io/lansing/">lansing (capital)</a>
+</nav>
+
+<div id="network-container"></div>
+
+<div class="info">
+  <h2>What is this?</h2>
+  <p>This graph maps documented connections between actors in a Detroit charter school network. Convicted felons operating schools. Sitting judges on their boards. Millions in public funding. Every edge represents a verified connection sourced to court records, campaign finance filings, LARA registrations, or investigative journalism.</p>
+  <p style="margin-top:0.5rem;">The full evidence library with citations is at <a href="https://defenddetroit.github.io/publicRecord/" style="color:#58a6ff;">defenddetroit.github.io/publicRecord</a>.</p>
+</div>
+
+<footer>
+  defendDetroit · ecoPrimal · Every fact cited from public records · <a href="https://github.com/defendDetroit/detroit" style="color:#58a6ff;">source</a>
+</footer>
+
+<script src="js/network-data.js"></script>
+<script src="js/network-graph-layout.js"></script>
+<script src="js/network-graph.js"></script>
+<script src="js/signal-exploration.js"></script>
+<script src="js/timeline-graph.js"></script>
+</body>
+</html>
